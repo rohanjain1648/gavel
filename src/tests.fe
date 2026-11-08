@@ -1,0 +1,14 @@
+//! Gavel's test suite. Run it with `fe test`.
+//!
+//! - `harness`: `GavelHarness`, which hosts the production `Auction` with a
+//!   clock the tests can move. It also has `Bidder` proxies that hold their
+//!   own ETH and tokens, and helpers.
+//! - `book_tests`: the clearing book's rules, one case at a time.
+//! - `lifecycle_tests`: complete auctions from funding to the last payout.
+//! - `guard_tests`: every phase check and validation error.
+//! - `security_tests`: reentrancy, failing receivers and accounting.
+//! - `differential_tests`: random auctions checked against a sort-based
+//!   reference implementation.
+//! - `gavel_tests`: the production `Gavel` contract and its block clock.
+//! - `gas_tests`: gas measurements, reported as events
+//!   (`fe test --show-logs --filter gas`).

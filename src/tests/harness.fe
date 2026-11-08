@@ -1,0 +1,517 @@
+//! Test fixtures: a harness contract with a movable clock, bidder proxies and
+//! helpers.
+use std::evm::{Address, Call, Ctx, Evm, Log, ether, hours}
+use ingot::auction::{Auction, Config}
+use ingot::bid::commitment
+use ingot::clock::{BlockTime, Clock}
+use ingot::gavel::{GavelMsg, configure, handle_claim, handle_fund, handle_withdraw_proceeds}
+use ingot::token::{Erc20Msg, LotToken}
+
+/// Token base units per lot in the test markets.
+pub const LOT: u256 = 1_000_000_000_000_000_000
+
+/// Default phase lengths.
+pub const COMMIT: Duration = hours(1)
+pub const REVEAL: Duration = hours(1)
+
+/// Gas for one call in the tests.
+pub const GAS: u256 = 10_000_000
+
+pub msg HarnessMsg {
+    /// Moves the harness's clock forward.
+    #[selector = sol("warp(uint256)")]
+    Warp { by: Duration },
+    #[selector = sol("now()")]
+    Now -> Timestamp,
+}
+
+/// The production `Auction`, with a clock the test can move.
+///
+/// The contract has the same fields, init and handlers as `Gavel`, and
+/// calls the same state machine and payout functions. The only difference
+/// is the `Clock` its handlers provide: the block timestamp plus `warp`.
+pub contract GavelHarness uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    config: Config,
+    mut auction: Auction,
+    mut warp: Duration,
+
+    init(
+        seller: Address,
+        token: Address,
+        lot_size: u256,
+        supply: u64,
+        min_lots: u64,
+        reserve: Wei,
+        penalty_bps: u256,
+        commit_period: Duration,
+        reveal_period: Duration,
+    )
+    uses (ctx, mut config, mut auction)
+    {
+        config = configure(
+            seller,
+            token,
+            lot_size,
+            supply,
+            min_lots,
+            reserve,
+            penalty_bps,
+            commit_period,
+            reveal_period,
+        )
+        auction.open(supply: supply as u256)
+    }
+
+    recv GavelMsg {
+        Fund uses (ctx, mut call, config, mut auction, mut log, warp) {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                handle_fund()
+            }
+        }
+
+        #[payable]
+        Commit { commitment } -> u64 uses (ctx, config, mut auction, mut log, warp) {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                auction.commit(bidder: ctx.caller(), commitment, deposit: ctx.value())
+            }
+        }
+
+        Reveal { id, price, quantity, salt } -> bool
+        uses (ctx, config, mut auction, mut log, warp)
+        {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                auction.reveal(id, price, quantity, salt)
+            }
+        }
+
+        Claim { id } -> u256 uses (ctx, mut call, config, mut auction, mut log, warp) {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                handle_claim(id)
+            }
+        }
+
+        WithdrawProceeds -> Wei uses (ctx, mut call, config, mut auction, mut log, warp) {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                handle_withdraw_proceeds()
+            }
+        }
+
+        CurrentPhase -> u8 uses (ctx, config, warp) {
+            with (Clock = BlockTime::at(ctx.timestamp() + warp)) {
+                config.schedule.phase().code()
+            }
+        }
+
+        GetSchedule -> (Timestamp, Timestamp) uses (config) {
+            (config.schedule.commit_end, config.schedule.reveal_end)
+        }
+
+        ClearingPrice -> Wei uses (config, auction) {
+            auction.clearing_price()
+        }
+
+        Demand -> u256 uses (auction) {
+            auction.demand()
+        }
+
+        Sold -> u256 uses (auction) {
+            auction.sold()
+        }
+
+        BookSize -> u256 uses (auction) {
+            auction.book_size()
+        }
+
+        Marginal -> (bool, u64, u128) uses (auction) {
+            auction.marginal()
+        }
+
+        BidCount -> u64 uses (auction) {
+            auction.bid_count()
+        }
+
+        BidOf { id } -> (Address, u8, u128, u64, Wei)
+        uses (auction)
+        {
+            let record = auction.bid(id)
+            (record.bidder, record.status.code(), record.price, record.quantity, record.deposit)
+        }
+
+        IsWinning { id } -> bool uses (auction) {
+            auction.is_winning(id)
+        }
+
+        Allocation { id } -> u256 uses (auction) {
+            auction.allocation(id)
+        }
+
+        CommitmentOf { bidder, price, quantity, salt } -> u256
+        uses (config)
+        {
+            commitment(
+                chain_id: config.chain_id,
+                auction: config.auction,
+                bidder,
+                price,
+                quantity,
+                salt,
+            )
+        }
+    }
+
+    recv HarnessMsg {
+        Warp { by } uses (mut warp) {
+            warp += by
+        }
+
+        Now -> Timestamp uses (ctx, warp) {
+            ctx.timestamp() + warp
+        }
+    }
+}
+
+// --- Bidders -----------------------------------------------------------------
+
+pub msg BidderMsg {
+    /// Commits to `auction` with `deposit` of the ETH sent along.
+    #[selector = sol("commit(address,uint256)")]
+    Commit { auction: Address, commitment: u256 } -> u64,
+    /// Makes the bidder refuse ETH.
+    #[selector = sol("setRejectEth(bool)")]
+    SetRejectEth { reject: bool },
+    /// Makes the bidder call `claim(id)` on `auction` again when it receives ETH.
+    #[selector = sol("setReenter(address,uint64)")]
+    SetReenter { auction: Address, id: u64 },
+    /// ETH received from payouts so far.
+    #[selector = sol("received()")]
+    Received -> Wei,
+    /// How many reentrant calls succeeded (should stay 0).
+    #[selector = sol("reentrySuccesses()")]
+    ReentrySuccesses -> u256,
+}
+
+struct BidderState {
+    reject_eth: bool,
+    reenter: bool,
+    target: Address,
+    target_id: u64,
+    received: Wei,
+    reentry_successes: u256,
+}
+
+/// A bidder with its own address, ETH and tokens.
+pub contract Bidder uses (ctx: Ctx, call: mut Call) {
+    mut state: BidderState,
+
+    recv {
+        #[payable]
+        BidderMsg::Commit { auction, commitment } -> u64
+        uses (ctx, mut call)
+        {
+            call.call(
+                addr: auction,
+                gas: ctx.gas(),
+                value: ctx.value(),
+                message: GavelMsg::Commit { commitment },
+            )
+        }
+
+        BidderMsg::SetRejectEth { reject } uses (mut state) {
+            state.reject_eth = reject
+        }
+
+        BidderMsg::SetReenter { auction, id } uses (mut state) {
+            state.reenter = true
+            state.target = auction
+            state.target_id = id
+        }
+
+        BidderMsg::Received -> Wei uses (state) {
+            state.received
+        }
+
+        BidderMsg::ReentrySuccesses -> u256 uses (state) {
+            state.reentry_successes
+        }
+
+        // Receives payouts.
+        #[payable]
+        _ uses (ctx, mut call, mut state) {
+            assert!(!state.reject_eth, "bidder rejects ETH")
+            state.received += ctx.value()
+            if state.reenter {
+                state.reenter = false
+                let outcome = call
+                    .try_call(
+                        addr: state.target,
+                        gas: ctx.gas(),
+                        value: Wei::zero(),
+                        message: GavelMsg::Claim { id: state.target_id },
+                    )
+                if outcome.success() {
+                    state.reentry_successes += 1
+                }
+            }
+        }
+    }
+}
+
+// --- Markets -----------------------------------------------------------------
+
+/// A deployed and funded auction, with its token and its seller.
+pub struct Market {
+    pub auction: Address,
+    pub token: Address,
+    /// A `Bidder` contract, so it can receive the proceeds.
+    pub seller: Address,
+}
+
+impl Copy for Market {}
+
+/// Deploys a token and a harness auction selling `supply` lots, and funds it
+/// from the test contract. The seller is a fresh `Bidder` contract.
+pub fn open_market(supply: u64, min_lots: u64, reserve: Wei, penalty_bps: u256) -> Market
+uses (evm: mut Evm)
+{
+    let market = deploy_market(supply, min_lots, reserve, penalty_bps)
+    approve(market, amount: supply as u256 * LOT)
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Fund {},
+    )
+    market
+}
+
+/// Deploys a token and a harness auction without funding it.
+pub fn deploy_market(supply: u64, min_lots: u64, reserve: Wei, penalty_bps: u256) -> Market
+uses (evm: mut Evm)
+{
+    let token = evm.create<LotToken>(value: Wei::zero(), args: (1_000_000 * LOT,))
+    let seller = new_bidder()
+    let auction = evm
+        .create<GavelHarness>(
+            value: Wei::zero(),
+            args: (seller, token, LOT, supply, min_lots, reserve, penalty_bps, COMMIT, REVEAL),
+        )
+    Market { auction, token, seller }
+}
+
+pub fn approve(_ market: Market, amount: u256) uses (evm: mut Evm) {
+    let ok: bool = evm
+        .call(
+            addr: market.token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::Approve { spender: market.auction, amount },
+        )
+    assert!(ok)
+}
+
+pub fn new_bidder() -> Address uses (evm: mut Evm) {
+    evm.create<Bidder>(value: Wei::zero(), args: ())
+}
+
+/// The commitment `bidder` makes for a bid in `market`.
+pub fn sealed(_ market: Market, bidder: Address, price: u128, quantity: u64, salt: u256) -> u256
+uses (evm: mut Evm)
+{
+    commitment(
+        chain_id: evm.chainid(),
+        auction: market.auction,
+        bidder,
+        price,
+        quantity,
+        salt,
+    )
+}
+
+/// `bidder` commits to a bid with `deposit`. Returns the bid id.
+pub fn commit(
+    _ market: Market,
+    bidder: Address,
+    price: u128,
+    quantity: u64,
+    salt: u256,
+    deposit: Wei,
+) -> u64
+uses (evm: mut Evm)
+{
+    let c = sealed(market, bidder, price, quantity, salt)
+    evm.call(
+        addr: bidder,
+        gas: GAS,
+        value: deposit,
+        message: BidderMsg::Commit { auction: market.auction, commitment: c },
+    )
+}
+
+/// Commits with a deposit of exactly the bid's cost.
+pub fn commit_exact(
+    _ market: Market,
+    bidder: Address,
+    price: u128,
+    quantity: u64,
+    salt: u256,
+) -> u64
+uses (evm: mut Evm)
+{
+    commit(
+        market,
+        bidder,
+        price,
+        quantity,
+        salt,
+        deposit: cost(price, quantity),
+    )
+}
+
+pub fn cost(_ price: u128, _ quantity: u64) -> Wei {
+    std::evm::wei(price as u256 * quantity as u256)
+}
+
+pub fn reveal(_ market: Market, id: u64, price: u128, quantity: u64, salt: u256) -> bool
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Reveal { id, price, quantity, salt },
+    )
+}
+
+pub fn claim(_ market: Market, id: u64) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Claim { id },
+    )
+}
+
+pub fn withdraw_proceeds(_ market: Market) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::WithdrawProceeds {},
+    )
+}
+
+pub fn warp(_ market: Market, by: Duration) uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: HarnessMsg::Warp { by },
+    )
+}
+
+/// Moves the clock from the commit phase to the reveal phase.
+pub fn to_reveal(_ market: Market) uses (evm: mut Evm) {
+    warp(market, by: COMMIT)
+}
+
+/// Moves the clock from the reveal phase to the end of the auction.
+pub fn to_settled(_ market: Market) uses (evm: mut Evm) {
+    warp(market, by: REVEAL)
+}
+
+pub fn phase(_ market: Market) -> u8 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::CurrentPhase {},
+    )
+}
+
+pub fn clearing_price(_ market: Market) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::ClearingPrice {},
+    )
+}
+
+pub fn allocation(_ market: Market, id: u64) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Allocation { id },
+    )
+}
+
+pub fn is_winning(_ market: Market, id: u64) -> bool uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::IsWinning { id },
+    )
+}
+
+pub fn sold(_ market: Market) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Sold {},
+    )
+}
+
+pub fn demand(_ market: Market) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Demand {},
+    )
+}
+
+pub fn book_size(_ market: Market) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::BookSize {},
+    )
+}
+
+/// Status code of a bid: 0 unknown, 1 committed, 2 revealed, 3 claimed.
+pub fn status(_ market: Market, id: u64) -> u8 uses (evm: mut Evm) {
+    let (_, status, _, _, _): (Address, u8, u128, u64, Wei) = evm
+        .call(
+            addr: market.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::BidOf { id },
+        )
+    status
+}
+
+pub fn tokens_of(_ market: Market, _ who: Address) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market.token,
+        gas: GAS,
+        value: Wei::zero(),
+        message: Erc20Msg::BalanceOf { account: who },
+    )
+}
+
+pub fn received(_ bidder: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: bidder,
+        gas: GAS,
+        value: Wei::zero(),
+        message: BidderMsg::Received {},
+    )
+}
+
+/// A comfortable test balance: `#[test(balance = ...)]` takes a literal, so
+/// tests write `1_000_000_000_000_000_000_000` (1000 ether).
+pub const FUNDS: Wei = ether(1000)

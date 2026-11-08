@@ -1,0 +1,316 @@
+//! Reentrancy, failing receivers and third-party actions.
+use std::evm::{Ctx, Evm}
+use std::evm::returndata::is_error
+use ingot::gavel::{EthTransferFailed, GavelMsg, TokenShortfall}
+use ingot::token::Erc20Msg
+use ingot::tests::harness::{
+    BidderMsg,
+    GAS,
+    LOT,
+    allocation,
+    claim,
+    commit,
+    commit_exact,
+    cost,
+    new_bidder,
+    open_market,
+    received,
+    reveal,
+    status,
+    to_reveal,
+    to_settled,
+    tokens_of,
+    withdraw_proceeds,
+}
+
+/// A bidder whose fallback calls `claim` again on the bid being paid. The
+/// state machine marks the bid claimed before the contract pays, so the
+/// reentrant claim reverts and the bidder is paid once.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reentrant_claim_is_paid_once() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 2,
+        min_lots: 1,
+        reserve: std::evm::wei(10),
+        penalty_bps: 0,
+    )
+    let alice = new_bidder()
+    let mallory = new_bidder()
+    let a = commit_exact(m, bidder: alice, price: 50, quantity: 2, salt: 1)
+    let x = commit_exact(m, bidder: mallory, price: 20, quantity: 2, salt: 2)
+    evm.call(
+        addr: mallory,
+        gas: GAS,
+        value: Wei::zero(),
+        message: BidderMsg::SetReenter { auction: m.auction, id: x },
+    )
+    to_reveal(m)
+    assert!(reveal(m, id: a, price: 50, quantity: 2, salt: 1))
+    assert!(!reveal(m, id: x, price: 20, quantity: 2, salt: 2))
+
+    assert!(claim(m, id: x) == 0)
+    assert!(received(mallory) == cost(20, 2))
+    let successes: u256 = evm
+        .call(
+            addr: mallory,
+            gas: GAS,
+            value: Wei::zero(),
+            message: BidderMsg::ReentrySuccesses {},
+        )
+    assert!(successes == 0)
+    assert!(evm.balance(m.auction) == cost(50, 2))
+}
+
+/// A winner whose fallback calls `claim` again while being paid its change.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reentrant_winner_claim_is_paid_once() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 4,
+        min_lots: 1,
+        reserve: std::evm::wei(10),
+        penalty_bps: 0,
+    )
+    let mallory = new_bidder()
+    let bob = new_bidder()
+    let x = commit_exact(m, bidder: mallory, price: 90, quantity: 2, salt: 1)
+    let b = commit_exact(m, bidder: bob, price: 30, quantity: 2, salt: 2)
+    evm.call(
+        addr: mallory,
+        gas: GAS,
+        value: Wei::zero(),
+        message: BidderMsg::SetReenter { auction: m.auction, id: x },
+    )
+    to_reveal(m)
+    assert!(reveal(m, id: x, price: 90, quantity: 2, salt: 1))
+    assert!(reveal(m, id: b, price: 30, quantity: 2, salt: 2))
+    to_settled(m)
+
+    assert!(claim(m, id: x) == 2)
+    // Mallory paid 2 lots at the clearing price of 30.
+    assert!(received(mallory) == cost(90, 2) - cost(30, 2))
+    assert!(tokens_of(m, mallory) == 2 * LOT)
+    let successes: u256 = evm
+        .call(
+            addr: mallory,
+            gas: GAS,
+            value: Wei::zero(),
+            message: BidderMsg::ReentrySuccesses {},
+        )
+    assert!(successes == 0)
+    assert!(claim(m, id: b) == 2)
+    assert!(withdraw_proceeds(m) == cost(30, 4))
+    assert!(evm.balance(m.auction) == Wei::zero())
+}
+
+/// A bidder that refuses ETH cannot be paid. The claim reverts as a whole,
+/// so the bid stays claimable: nothing is lost, and nobody else is
+/// blocked.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn failed_refund_keeps_the_bid_claimable() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 2,
+        min_lots: 1,
+        reserve: std::evm::wei(10),
+        penalty_bps: 0,
+    )
+    let alice = new_bidder()
+    let bob = new_bidder()
+    // Alice deposits 20 more than her bid costs, so she is owed change.
+    let a = commit(
+        m,
+        bidder: alice,
+        price: 50,
+        quantity: 2,
+        salt: 1,
+        deposit: cost(60, 2),
+    )
+    let b = commit_exact(m, bidder: bob, price: 40, quantity: 2, salt: 2)
+    evm.call(
+        addr: alice,
+        gas: GAS,
+        value: Wei::zero(),
+        message: BidderMsg::SetRejectEth { reject: true },
+    )
+    to_reveal(m)
+    assert!(reveal(m, id: a, price: 50, quantity: 2, salt: 1))
+    assert!(!reveal(m, id: b, price: 40, quantity: 2, salt: 2))
+    to_settled(m)
+
+    // Bob's bid was rejected, so Alice pays her own 50 per lot and is owed
+    // 20 in change, which she refuses.
+    let outcome = evm
+        .try_call(
+            addr: m.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Claim { id: a },
+        )
+    assert!(is_error<EthTransferFailed>(outcome.returndata()))
+    assert!(status(m, id: a) == 2)
+    assert!(tokens_of(m, alice) == 0)
+
+    // Others are unaffected.
+    assert!(claim(m, id: b) == 0)
+    assert!(withdraw_proceeds(m) == cost(50, 2))
+
+    // Once Alice accepts ETH, her claim goes through.
+    evm.call(
+        addr: alice,
+        gas: GAS,
+        value: Wei::zero(),
+        message: BidderMsg::SetRejectEth { reject: false },
+    )
+    assert!(claim(m, id: a) == 2)
+    assert!(received(alice) == cost(10, 2))
+    assert!(tokens_of(m, alice) == 2 * LOT)
+    assert!(evm.balance(m.auction) == Wei::zero())
+}
+
+/// Anyone may reveal or claim on a bidder's behalf. Payouts still go to the
+/// bidder, never to the caller.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn third_parties_can_only_help() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 3,
+        min_lots: 1,
+        reserve: std::evm::wei(10),
+        penalty_bps: 0,
+    )
+    let alice = new_bidder()
+    let a = commit_exact(m, bidder: alice, price: 70, quantity: 3, salt: 9)
+    to_reveal(m)
+    // The test contract, not Alice, reveals and claims.
+    assert!(reveal(m, id: a, price: 70, quantity: 3, salt: 9))
+    to_settled(m)
+    let me = evm.address()
+    let my_tokens = tokens_of(m, me)
+    assert!(claim(m, id: a) == 3)
+    assert!(tokens_of(m, alice) == 3 * LOT)
+    assert!(tokens_of(m, me) == my_tokens)
+    assert!(withdraw_proceeds(m) == cost(70, 3))
+    assert!(received(m.seller) == cost(70, 3))
+}
+
+/// A losing bid gets no lots, even when it is claimed after the end.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn loser_never_receives_lots() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 2,
+        min_lots: 1,
+        reserve: std::evm::wei(10),
+        penalty_bps: 0,
+    )
+    let alice = new_bidder()
+    let bob = new_bidder()
+    let a = commit_exact(m, bidder: alice, price: 50, quantity: 2, salt: 1)
+    let b = commit_exact(m, bidder: bob, price: 40, quantity: 2, salt: 2)
+    to_reveal(m)
+    assert!(reveal(m, id: b, price: 40, quantity: 2, salt: 2))
+    assert!(reveal(m, id: a, price: 50, quantity: 2, salt: 1))
+    to_settled(m)
+    assert!(allocation(m, id: b) == 0)
+    assert!(claim(m, id: b) == 0)
+    assert!(tokens_of(m, bob) == 0)
+    assert!(received(bob) == cost(40, 2))
+    assert!(claim(m, id: a) == 2)
+}
+
+// --- Fee-on-transfer tokens ---------------------------------------------------
+
+struct FeeLedger {
+    balances: std::evm::StorageMap<std::evm::Address, u256>,
+    allowances: std::evm::StorageMap<(std::evm::Address, std::evm::Address), u256>,
+}
+
+impl FeeLedger {
+    // Delivers 99% of every transfer and burns the rest.
+    fn skim(mut self, from: std::evm::Address, to: std::evm::Address, amount: u256) {
+        self.balances.set(key: from, value: self.balances.get(key: from) - amount)
+        self.balances.set(
+                key: to,
+                value: self.balances.get(key: to) + amount - amount / 100,
+            )
+    }
+}
+
+/// An ERC-20 that keeps 1% of every transfer.
+pub contract FeeToken uses (ctx: Ctx) {
+    mut ledger: FeeLedger,
+
+    init(supply: u256)
+    uses (ctx, mut ledger)
+    {
+        ledger.balances.set(key: ctx.caller(), value: supply)
+    }
+
+    recv Erc20Msg {
+        Decimals -> u8 {
+            18
+        }
+        TotalSupply -> u256 {
+            0
+        }
+        BalanceOf { account } -> u256 uses (ledger) {
+            ledger.balances.get(key: account)
+        }
+        Allowance { owner, spender } -> u256 uses (ledger) {
+            ledger.allowances.get(key: (owner, spender))
+        }
+        Transfer { to, amount } -> bool uses (ctx, mut ledger) {
+            ledger.skim(from: ctx.caller(), to, amount)
+            true
+        }
+        Approve { spender, amount } -> bool uses (ctx, mut ledger) {
+            ledger.allowances.set(key: (ctx.caller(), spender), value: amount)
+            true
+        }
+        TransferFrom { from, to, amount } -> bool
+        uses (ctx, mut ledger)
+        {
+            let key = (from, ctx.caller())
+            ledger.allowances.set(key, value: ledger.allowances.get(key) - amount)
+            ledger.skim(from, to, amount)
+            true
+        }
+    }
+}
+
+/// Funding with a token that delivers less than it is asked to transfer is
+/// refused, so the auction never owes more lots than it holds.
+#[test]
+fn fee_on_transfer_token_cannot_be_auctioned() uses (evm: mut Evm) {
+    let token = evm.create<FeeToken>(value: Wei::zero(), args: (1000 * LOT,))
+    let auction = evm
+        .create<ingot::tests::harness::GavelHarness>(
+            value: Wei::zero(),
+            args: (
+                new_bidder(),
+                token,
+                LOT,
+                10 as u64,
+                1 as u64,
+                std::evm::wei(1),
+                0,
+                std::evm::hours(1),
+                std::evm::hours(1),
+            ),
+        )
+    let ok: bool = evm
+        .call(
+            addr: token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::Approve { spender: auction, amount: 10 * LOT },
+        )
+    assert!(ok)
+    let outcome = evm
+        .try_call(
+            addr: auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Fund {},
+        )
+    assert!(is_error<TokenShortfall>(outcome.returndata()))
+    assert!(outcome.returndata().word_at(4) == 10 * LOT)
+    assert!(outcome.returndata().word_at(36) == 10 * LOT - LOT / 10)
+}

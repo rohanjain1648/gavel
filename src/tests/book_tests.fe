@@ -1,0 +1,294 @@
+//! The clearing book's rules, checked one case at a time through a
+//! contract that hosts a bare `ClearingBook`.
+use std::evm::{Address, Evm, Log, wei}
+use ingot::bid::Bid
+use ingot::book::ClearingBook
+
+msg BookMsg {
+    #[selector = 0x01]
+    Open { supply: u256 },
+    #[selector = 0x02]
+    Insert { price: u128, quantity: u64, id: u64 } -> bool,
+    #[selector = 0x03]
+    Allocation { price: u128, quantity: u64, id: u64 } -> u256,
+    #[selector = 0x04]
+    Clearing { reserve: Wei } -> Wei,
+    #[selector = 0x05]
+    Stats -> (u256, u256, u256, bool),
+    #[selector = 0x06]
+    Contains { id: u64 } -> bool,
+    #[selector = 0x07]
+    Marginal -> (bool, u64, u128),
+}
+
+pub contract BookHost uses (log: mut Log) {
+    mut book: ClearingBook,
+
+    recv BookMsg {
+        Open { supply } uses (mut book) {
+            book.open(supply)
+        }
+        Insert { price, quantity, id } -> bool uses (mut book, mut log) {
+            book.insert(Bid { price, quantity, id })
+        }
+        Allocation { price, quantity, id } -> u256
+        uses (book)
+        {
+            book.allocation(Bid { price, quantity, id })
+        }
+        Clearing { reserve } -> Wei uses (book) {
+            book.clearing_price(reserve)
+        }
+        // (demand, sold, len, full)
+        Stats -> (u256, u256, u256, bool) uses (book) {
+            (book.demand(), book.sold(), book.len(), book.is_full())
+        }
+        Contains { id } -> bool uses (book) {
+            book.contains(id)
+        }
+        Marginal -> (bool, u64, u128) uses (book) {
+            match book.marginal() {
+                Option::Some(bid) => (true, bid.id, bid.price),
+                Option::None => (false, 0, 0),
+            }
+        }
+    }
+}
+
+const RESERVE: Wei = wei(1)
+
+fn book(supply: u256) -> Address uses (evm: mut Evm) {
+    let host = evm.create<BookHost>(value: Wei::zero(), args: ())
+    evm.call(
+        addr: host,
+        gas: 1_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Open { supply },
+    )
+    host
+}
+
+fn insert(_ host: Address, price: u128, quantity: u64, id: u64) -> bool
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: host,
+        gas: 10_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Insert { price, quantity, id },
+    )
+}
+
+fn allocation(_ host: Address, price: u128, quantity: u64, id: u64) -> u256
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: host,
+        gas: 1_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Allocation { price, quantity, id },
+    )
+}
+
+fn clearing(_ host: Address) -> Wei uses (evm: mut Evm) {
+    evm.call(
+        addr: host,
+        gas: 1_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Clearing { reserve: RESERVE },
+    )
+}
+
+fn stats(_ host: Address) -> (u256, u256, u256, bool) uses (evm: mut Evm) {
+    evm.call(
+        addr: host,
+        gas: 1_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Stats {},
+    )
+}
+
+fn contains(_ host: Address, _ id: u64) -> bool uses (evm: mut Evm) {
+    evm.call(
+        addr: host,
+        gas: 1_000_000,
+        value: Wei::zero(),
+        message: BookMsg::Contains { id },
+    )
+}
+
+fn marginal_id(_ host: Address) -> u64 uses (evm: mut Evm) {
+    let (some, id, _): (bool, u64, u128) = evm
+        .call(
+            addr: host,
+            gas: 1_000_000,
+            value: Wei::zero(),
+            message: BookMsg::Marginal {},
+        )
+    assert!(some)
+    id
+}
+
+#[test]
+fn bid_order_is_price_then_earlier_id() {
+    let cheap = Bid { price: 5, quantity: 1, id: 0 }
+    let rich = Bid { price: 9, quantity: 1, id: 7 }
+    let early = Bid { price: 9, quantity: 3, id: 2 }
+    // `a < b` means a loses to b.
+    assert!(cheap < rich)
+    assert!(rich < early)
+    assert!(cheap < early)
+    assert!(!(early < rich) && !(rich < rich))
+    assert!(rich <= rich && early >= rich && early > cheap)
+    assert!(cheap.cost() == wei(5) && early.cost() == wei(27))
+}
+
+#[test]
+fn undersubscribed_book_sells_everything_at_the_reserve() uses (evm: mut Evm) {
+    let host = book(supply: 10)
+    assert!(insert(host, price: 5, quantity: 3, id: 0))
+    assert!(insert(host, price: 7, quantity: 4, id: 1))
+    let (demand, sold, len, full) = stats(host)
+    assert!(demand == 7 && sold == 7 && len == 2 && !full)
+    assert!(clearing(host) == RESERVE)
+    assert!(allocation(host, price: 5, quantity: 3, id: 0) == 3)
+    assert!(allocation(host, price: 7, quantity: 4, id: 1) == 4)
+}
+
+#[test]
+fn exactly_subscribed_book_clears_at_the_lowest_bid() uses (evm: mut Evm) {
+    let host = book(supply: 7)
+    assert!(insert(host, price: 5, quantity: 3, id: 0))
+    assert!(insert(host, price: 7, quantity: 4, id: 1))
+    let (demand, sold, len, full) = stats(host)
+    assert!(demand == 7 && sold == 7 && len == 2 && full)
+    assert!(clearing(host) == wei(5))
+    assert!(allocation(host, price: 5, quantity: 3, id: 0) == 3)
+    assert!(allocation(host, price: 7, quantity: 4, id: 1) == 4)
+}
+
+#[test]
+fn marginal_bid_is_filled_partially() uses (evm: mut Evm) {
+    let host = book(supply: 10)
+    assert!(insert(host, price: 10, quantity: 4, id: 0))
+    assert!(insert(host, price: 8, quantity: 4, id: 1))
+    assert!(insert(host, price: 6, quantity: 4, id: 2))
+    let (demand, sold, len, _) = stats(host)
+    assert!(demand == 12 && sold == 10 && len == 3)
+    assert!(marginal_id(host) == 2)
+    assert!(clearing(host) == wei(6))
+    assert!(allocation(host, price: 10, quantity: 4, id: 0) == 4)
+    assert!(allocation(host, price: 8, quantity: 4, id: 1) == 4)
+    assert!(allocation(host, price: 6, quantity: 4, id: 2) == 2)
+}
+
+#[test]
+fn better_bid_evicts_the_marginal_one() uses (evm: mut Evm) {
+    let host = book(supply: 10)
+    assert!(insert(host, price: 10, quantity: 4, id: 0))
+    assert!(insert(host, price: 8, quantity: 4, id: 1))
+    assert!(insert(host, price: 6, quantity: 4, id: 2))
+    // 9 beats 6: the bid at 6 no longer gets any lots and leaves.
+    assert!(insert(host, price: 9, quantity: 4, id: 3))
+    assert!(!contains(host, 2))
+    assert!(allocation(host, price: 6, quantity: 4, id: 2) == 0)
+    let (demand, sold, len, _) = stats(host)
+    assert!(demand == 12 && sold == 10 && len == 3)
+    assert!(marginal_id(host) == 1)
+    assert!(clearing(host) == wei(8))
+    assert!(allocation(host, price: 8, quantity: 4, id: 1) == 2)
+    assert!(allocation(host, price: 9, quantity: 4, id: 3) == 4)
+}
+
+#[test]
+fn full_book_rejects_bids_that_do_not_beat_the_margin() uses (evm: mut Evm) {
+    let host = book(supply: 10)
+    assert!(insert(host, price: 10, quantity: 6, id: 0))
+    assert!(insert(host, price: 8, quantity: 6, id: 1))
+    // Lower than the marginal price: rejected.
+    assert!(!insert(host, price: 7, quantity: 1, id: 2))
+    // Same price but a later id: it loses the tie, so it is rejected too.
+    assert!(!insert(host, price: 8, quantity: 1, id: 3))
+    assert!(!contains(host, 2) && !contains(host, 3))
+    let (demand, _, len, _) = stats(host)
+    assert!(demand == 12 && len == 2)
+    assert!(clearing(host) == wei(8))
+}
+
+#[test]
+fn ties_go_to_the_earlier_commitment() uses (evm: mut Evm) {
+    let host = book(supply: 5)
+    // Revealed in the opposite order of their commitments.
+    assert!(insert(host, price: 5, quantity: 3, id: 9))
+    assert!(insert(host, price: 5, quantity: 3, id: 4))
+    assert!(marginal_id(host) == 9)
+    assert!(allocation(host, price: 5, quantity: 3, id: 4) == 3)
+    assert!(allocation(host, price: 5, quantity: 3, id: 9) == 2)
+    // An equal-price bid with an even earlier id pushes id 9 out.
+    assert!(insert(host, price: 5, quantity: 2, id: 1))
+    assert!(!contains(host, 9))
+    assert!(allocation(host, price: 5, quantity: 2, id: 1) == 2)
+    assert!(allocation(host, price: 5, quantity: 3, id: 4) == 3)
+}
+
+#[test]
+fn one_large_bid_evicts_a_whole_cascade() uses (evm: mut Evm) {
+    let host = book(supply: 10)
+    var i: u64 = 0
+    while i < 10 {
+        assert!(insert(host, price: (i + 1) as u128, quantity: 1, id: i))
+        i += 1
+    }
+    let (_, _, len, full) = stats(host)
+    assert!(len == 10 && full)
+    assert!(clearing(host) == wei(1))
+    // Ten lots at 100 push all ten small bids out at once.
+    assert!(insert(host, price: 100, quantity: 10, id: 10))
+    let (demand, sold, len, _) = stats(host)
+    assert!(demand == 10 && sold == 10 && len == 1)
+    var j: u64 = 0
+    while j < 10 {
+        assert!(!contains(host, j))
+        j += 1
+    }
+    assert!(clearing(host) == wei(100))
+    assert!(allocation(host, price: 100, quantity: 10, id: 10) == 10)
+}
+
+#[test]
+fn clearing_price_never_falls_once_the_book_is_full() uses (evm: mut Evm) {
+    let host = book(supply: 20)
+    var x: u256 = 12345
+    var last = Wei::zero()
+    var id: u64 = 0
+    while id < 40 {
+        x = (x * 1103515245 + 12345) % 2147483648
+        let price: u128 = (x % 50 + 1).downcast_truncate()
+        let quantity: u64 = (x / 50 % 6 + 1).downcast_truncate()
+        let _ = insert(host, price, quantity, id)
+        let (_, _, _, full) = stats(host)
+        if full {
+            let now = clearing(host)
+            assert!(now >= last)
+            last = now
+        }
+        id += 1
+    }
+    assert!(last > Wei::zero())
+}
+
+#[test]
+fn empty_book_has_no_marginal_bid() uses (evm: mut Evm) {
+    let host = book(supply: 3)
+    let (some, _, _): (bool, u64, u128) = evm
+        .call(
+            addr: host,
+            gas: 1_000_000,
+            value: Wei::zero(),
+            message: BookMsg::Marginal {},
+        )
+    assert!(!some)
+    let (demand, sold, len, full) = stats(host)
+    assert!(demand == 0 && sold == 0 && len == 0 && !full)
+    assert!(clearing(host) == RESERVE)
+}

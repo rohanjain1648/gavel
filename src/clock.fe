@@ -1,0 +1,92 @@
+//! Time as an effect.
+//!
+//! Every function that depends on the time says so in its signature with
+//! `uses (clock: Clock)`, and its caller decides which clock it gets:
+//!
+//! ```fe
+//! // In the production contract: the block's timestamp.
+//! with (Clock = BlockTime::at(ctx.timestamp())) { auction.reveal(..) }
+//!
+//! // In a test harness: any time the test wants.
+//! with (Clock = BlockTime::at(ctx.timestamp() + warp)) { auction.reveal(..) }
+//! ```
+//!
+//! `fe test` runs each test in a single transaction, so the block time
+//! cannot move. With the clock as an effect, the auction logic runs
+//! unchanged at every point of its schedule, without cheat codes and without
+//! adding test-only paths to the production contract.
+use core::ops::Eq
+
+/// A source of the current time.
+pub trait Clock {
+    fn now(self) -> Timestamp
+}
+
+/// A clock frozen at one instant, such as the current block's timestamp.
+pub struct BlockTime { at: Timestamp }
+
+impl BlockTime {
+    pub fn at(_ at: Timestamp) -> Self {
+        BlockTime { at }
+    }
+}
+
+impl Clock for BlockTime {
+    fn now(self) -> Timestamp {
+        self.at
+    }
+}
+
+/// The three phases of an auction.
+pub enum Phase {
+    /// Bidders submit sealed commitments with their deposits.
+    Commit,
+    /// Bidders open their commitments. Bids enter the clearing book.
+    Reveal,
+    /// The result is final. Winners, losers and the seller are paid out.
+    Settled,
+}
+
+impl Copy for Phase {}
+
+impl Phase {
+    /// The phase's ABI code: 0 commit, 1 reveal, 2 settled.
+    pub fn code(self) -> u8 {
+        match self {
+            Phase::Commit => 0,
+            Phase::Reveal => 1,
+            Phase::Settled => 2,
+        }
+    }
+}
+
+impl Eq for Phase {
+    fn eq(self, _ other: Phase) -> bool {
+        self.code() == other.code()
+    }
+}
+
+/// When the commit and reveal phases end.
+pub struct Schedule { pub commit_end: Timestamp, pub reveal_end: Timestamp }
+
+impl Copy for Schedule {}
+
+impl Schedule {
+    /// The schedule that starts now.
+    pub fn starting(now: Timestamp, commit: Duration, reveal: Duration) -> Self {
+        let commit_end = now + commit
+        Schedule { commit_end, reveal_end: commit_end + reveal }
+    }
+
+    /// The phase at the clock's current time.
+    pub fn phase(self) -> Phase uses (clock: Clock) {
+        let now = clock.now()
+        if now < self.commit_end {
+            Phase::Commit
+        } else if now < self.reveal_end {
+            Phase::Reveal
+        } else {
+            Phase::Settled
+        }
+    }
+}

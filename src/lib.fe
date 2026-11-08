@@ -1,0 +1,12 @@
+//! Gavel: a sealed-bid, uniform-price batch auction written in Fe.
+//!
+//! - [`bid`]: bids, their priority order and commitments.
+//! - [`clock`]: time as an effect, and the auction's phases.
+//! - [`book`]: the clearing book, which settles the auction as bids arrive.
+//! - [`auction`]: the state machine. It has no `Call` effect, so it cannot
+//!   move funds.
+//! - [`gavel`]: the contract. It wires the effects together and makes the
+//!   transfers.
+//! - [`token`]: a minimal ERC-20 to auction.
+pub use gavel::{Gavel, GavelMsg}
+pub use token::{Erc20Msg, LotToken}

@@ -1,0 +1,125 @@
+//! `LotToken`: a minimal ERC-20 to auction in tests and in the demo.
+//!
+//! Gavel can sell any ERC-20 that follows the standard, including tokens that
+//! return no data from `transfer`, through `std::evm::erc20`'s safe helpers.
+//! This one mints its whole supply to the deployer.
+use std::evm::{Address, Ctx, Log, StorageMap}
+
+pub msg Erc20Msg {
+    #[selector = sol("decimals()")]
+    Decimals -> u8,
+    #[selector = sol("totalSupply()")]
+    TotalSupply -> u256,
+    #[selector = sol("balanceOf(address)")]
+    BalanceOf { account: Address } -> u256,
+    #[selector = sol("allowance(address,address)")]
+    Allowance { owner: Address, spender: Address } -> u256,
+    #[selector = sol("transfer(address,uint256)")]
+    Transfer { to: Address, amount: u256 } -> bool,
+    #[selector = sol("approve(address,uint256)")]
+    Approve { spender: Address, amount: u256 } -> bool,
+    #[selector = sol("transferFrom(address,address,uint256)")]
+    TransferFrom { from: Address, to: Address, amount: u256 } -> bool,
+}
+
+#[event]
+pub struct Transfer {
+    #[indexed]
+    pub from: Address,
+    #[indexed]
+    pub to: Address,
+    pub value: u256,
+}
+
+#[event]
+pub struct Approval {
+    #[indexed]
+    pub owner: Address,
+    #[indexed]
+    pub spender: Address,
+    pub value: u256,
+}
+
+#[error]
+pub struct InsufficientBalance { pub balance: u256, pub needed: u256 }
+
+#[error]
+pub struct InsufficientAllowance { pub allowance: u256, pub needed: u256 }
+
+pub struct Ledger {
+    total_supply: u256,
+    balances: StorageMap<Address, u256>,
+    allowances: StorageMap<(Address, Address), u256>,
+}
+
+impl Ledger {
+    fn move_tokens(mut self, from: Address, to: Address, amount: u256)
+    uses (log: mut Log)
+    {
+        let balance = self.balances.get(key: from)
+        if balance < amount {
+            revert_error(InsufficientBalance { balance, needed: amount })
+        }
+        self.balances.set(key: from, value: balance - amount)
+        self.balances.set(key: to, value: self.balances.get(key: to) + amount)
+        log.emit(Transfer { from, to, value: amount })
+    }
+}
+
+pub contract LotToken uses (ctx: Ctx, log: mut Log) {
+    mut ledger: Ledger,
+
+    init(supply: u256)
+    uses (ctx, mut ledger, mut log)
+    {
+        let owner = ctx.caller()
+        ledger.total_supply = supply
+        ledger.balances.set(key: owner, value: supply)
+        log.emit(
+            Transfer { from: Address::zero(), to: owner, value: supply },
+        )
+    }
+
+    recv Erc20Msg {
+        Decimals -> u8 {
+            18
+        }
+
+        TotalSupply -> u256 uses (ledger) {
+            ledger.total_supply
+        }
+
+        BalanceOf { account } -> u256 uses (ledger) {
+            ledger.balances.get(key: account)
+        }
+
+        Allowance { owner, spender } -> u256 uses (ledger) {
+            ledger.allowances.get(key: (owner, spender))
+        }
+
+        Transfer { to, amount } -> bool uses (ctx, mut ledger, mut log) {
+            ledger.move_tokens(from: ctx.caller(), to, amount)
+            true
+        }
+
+        Approve { spender, amount } -> bool uses (ctx, mut ledger, mut log) {
+            let owner = ctx.caller()
+            ledger.allowances.set(key: (owner, spender), value: amount)
+            log.emit(Approval { owner, spender, value: amount })
+            true
+        }
+
+        TransferFrom { from, to, amount } -> bool
+        uses (ctx, mut ledger, mut log)
+        {
+            let spender = ctx.caller()
+            let allowance = ledger.allowances.get(key: (from, spender))
+            if allowance < amount {
+                revert_error(InsufficientAllowance { allowance, needed: amount })
+            }
+            ledger.allowances.set(key: (from, spender), value: allowance - amount)
+            ledger.move_tokens(from, to, amount)
+            true
+        }
+    }
+}

@@ -1,0 +1,270 @@
+//! The production `Gavel` contract, which reads the block's clock.
+//!
+//! A `fe test` runs in one transaction, so the block time never moves here:
+//! a fresh `Gavel` stays in its commit phase. These tests check what the
+//! harness cannot: the production wiring, the block clock, the views and
+//! that time-gated calls are refused. The full lifecycle of `Gavel` itself
+//! runs on a real chain in `scripts/demo.sh`.
+use std::evm::{Address, Evm, hours, wei}
+use std::evm::returndata::is_error
+use ingot::auction::{NotFunded, WrongPhase}
+use ingot::bid::commitment
+use ingot::gavel::{Gavel, GavelMsg}
+use ingot::tests::harness::{BidderMsg, GAS, LOT, new_bidder}
+use ingot::token::{Erc20Msg, LotToken}
+
+struct Deployed { auction: Address, token: Address, seller: Address }
+
+impl Copy for Deployed {}
+
+fn deploy() -> Deployed uses (evm: mut Evm) {
+    let token = evm.create<LotToken>(value: Wei::zero(), args: (100 * LOT,))
+    let seller = new_bidder()
+    let auction = evm
+        .create<Gavel>(
+            value: Wei::zero(),
+            args: (seller, token, LOT, 10 as u64, 2 as u64, wei(1000), 250, hours(24), hours(12)),
+        )
+    Deployed { auction, token, seller }
+}
+
+fn fund(_ d: Deployed) uses (evm: mut Evm) {
+    let ok: bool = evm
+        .call(
+            addr: d.token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::Approve { spender: d.auction, amount: 10 * LOT },
+        )
+    assert!(ok)
+    evm.call(
+        addr: d.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Fund {},
+    )
+}
+
+#[test]
+fn schedule_follows_the_block_clock() uses (evm: mut Evm) {
+    let d = deploy()
+    let (commit_end, reveal_end): (Timestamp, Timestamp) = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::GetSchedule {},
+        )
+    assert!(commit_end == evm.timestamp() + hours(24))
+    assert!(reveal_end == commit_end + hours(12))
+    let phase: u8 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::CurrentPhase {},
+        )
+    assert!(phase == 0)
+}
+
+#[test]
+fn funding_moves_the_lots() uses (evm: mut Evm) {
+    let d = deploy()
+    let before: u256 = evm
+        .call(
+            addr: d.token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::BalanceOf { account: evm.address() },
+        )
+    fund(d)
+    let held: u256 = evm
+        .call(
+            addr: d.token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::BalanceOf { account: d.auction },
+        )
+    let after: u256 = evm
+        .call(
+            addr: d.token,
+            gas: GAS,
+            value: Wei::zero(),
+            message: Erc20Msg::BalanceOf { account: evm.address() },
+        )
+    assert!(held == 10 * LOT)
+    assert!(before - after == 10 * LOT)
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn commits_are_taken_and_reveals_wait_for_the_clock() uses (evm: mut Evm) {
+    let d = deploy()
+    let alice = new_bidder()
+    let c = commitment(
+        chain_id: evm.chainid(),
+        auction: d.auction,
+        bidder: alice,
+        price: 2000,
+        quantity: 3,
+        salt: 99,
+    )
+
+    // No commitments before funding.
+    let early = evm
+        .try_call(
+            addr: d.auction,
+            gas: GAS,
+            value: wei(6000),
+            message: GavelMsg::Commit { commitment: c },
+        )
+    assert!(is_error<NotFunded>(early.returndata()))
+
+    fund(d)
+    let id: u64 = evm
+        .call(
+            addr: alice,
+            gas: GAS,
+            value: wei(6000),
+            message: BidderMsg::Commit { auction: d.auction, commitment: c },
+        )
+    assert!(id == 0)
+    let count: u64 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::BidCount {},
+        )
+    assert!(count == 1)
+    let (bidder, status, _, _, deposit): (Address, u8, u128, u64, Wei) = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::BidOf { id },
+        )
+    assert!(bidder == alice && status == 1 && deposit == wei(6000))
+    assert!(evm.balance(d.auction) == wei(6000))
+
+    // The block clock is still in the commit phase: reveals and claims wait.
+    let reveal = evm
+        .try_call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Reveal { id, price: 2000, quantity: 3, salt: 99 },
+        )
+    assert!(is_error<WrongPhase>(reveal.returndata()))
+    let claim = evm
+        .try_call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Claim { id },
+        )
+    assert!(is_error<WrongPhase>(claim.returndata()))
+    let proceeds = evm
+        .try_call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::WithdrawProceeds {},
+        )
+    assert!(is_error<WrongPhase>(proceeds.returndata()))
+}
+
+#[test]
+fn commitment_helper_matches_the_library() uses (evm: mut Evm) {
+    let d = deploy()
+    let bidder = Address::new(0xb1dde5)
+    let onchain: u256 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::CommitmentOf { bidder, price: 12345, quantity: 7, salt: 0xabc },
+        )
+    assert!(
+        onchain
+            == commitment(
+                chain_id: evm.chainid(),
+                auction: d.auction,
+                bidder,
+                price: 12345,
+                quantity: 7,
+                salt: 0xabc,
+            ),
+    )
+}
+
+/// The commitment is plain `keccak256(abi.encode(...))` of six words, so any
+/// client can compute it. `demo/run.mjs` computes commitments the same way
+/// with viem, and the contract accepts them.
+#[test]
+fn commitment_test_vector() {
+    let c = commitment(
+        chain_id: 31337,
+        auction: Address::new(0x5fbdb2315678afecb367f032d93f642f64180aa3),
+        bidder: Address::new(0x70997970c51812dc3a010c7d01b50e0d17dc79c8),
+        price: 1_000_000_000_000_000,
+        quantity: 3,
+        salt: 42,
+    )
+    assert!(
+        c
+            == std::evm::keccak_words(
+                [
+                    31337,
+                    0x5fbdb2315678afecb367f032d93f642f64180aa3,
+                    0x70997970c51812dc3a010c7d01b50e0d17dc79c8,
+                    1_000_000_000_000_000,
+                    3,
+                    42,
+                ],
+            ),
+    )
+}
+
+#[test]
+fn views_start_empty() uses (evm: mut Evm) {
+    let d = deploy()
+    let price: Wei = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::ClearingPrice {},
+        )
+    let demand: u256 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Demand {},
+        )
+    let sold: u256 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Sold {},
+        )
+    let size: u256 = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::BookSize {},
+        )
+    let (some, _, _): (bool, u64, u128) = evm
+        .call(
+            addr: d.auction,
+            gas: GAS,
+            value: Wei::zero(),
+            message: GavelMsg::Marginal {},
+        )
+    assert!(
+        price == wei(1000) && demand == 0 && sold == 0 && size == 0 && !some,
+    )
+    let _ = d.seller
+}

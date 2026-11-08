@@ -1,0 +1,167 @@
+//! The clearing book: a uniform-price auction that clears as bids arrive.
+//!
+//! A sealed-bid batch auction usually collects every bid and sorts them once
+//! the bidding ends. On-chain, that final step is a loop over all bids. Its
+//! gas grows with the number of bidders, and enough bidders make it
+//! impossible to settle at all.
+//!
+//! The book never waits for the end. It keeps only the bids that would win
+//! if the auction ended now, in a [`StorageHeap`] whose root is the marginal
+//! bid, the worst bid that still receives lots. It maintains one invariant:
+//!
+//! > Without the marginal bid, the other bids in the book ask for fewer lots
+//! > than the supply: `demand - marginal.quantity < supply`.
+//!
+//! So every bid in the book receives lots. The bids above the marginal one
+//! are filled completely, and the marginal bid receives what is left. A
+//! revealed bid either enters the book, possibly pushing out bids that no
+//! longer receive anything, or is rejected at once. A bid that leaves the
+//! book can never come back. The bids that push it out stay revealed, so
+//! the lots above it stay taken. Losers can therefore take their deposits
+//! back as soon as they lose, before the auction ends.
+//!
+//! Each reveal costs `O(log n)` heap work plus one pop per evicted bid, and
+//! a bid is evicted at most once. Reading the clearing price or a bid's
+//! allocation costs `O(1)`, so settling the auction needs no loop.
+//!
+//! The book's only effect is `Log`. It cannot call other contracts or move
+//! funds, and the compiler checks that: those operations need a `Call`
+//! effect, which no function in this module has.
+use std::evm::{StorageMap, wei}
+use std::evm::heap::StorageHeap
+use ingot::bid::Bid
+
+/// A bid left the book: it no longer receives any lots. Its deposit can be
+/// claimed back at once.
+#[event]
+pub struct Outbid {
+    #[indexed]
+    pub id: u64,
+    pub price: u128,
+    pub quantity: u64,
+}
+
+pub struct ClearingBook {
+    /// Lots on sale.
+    supply: u256,
+    /// Total quantity of the bids in the book.
+    demand: u256,
+    /// The bids that currently win, with the marginal bid at the root.
+    heap: StorageHeap<Bid>,
+    /// Whether a bid id is in `heap`, so membership is an `O(1)` lookup.
+    in_book: StorageMap<u64, bool>,
+}
+
+impl ClearingBook {
+    /// Puts `supply` lots on sale. The book must be empty.
+    pub fn open(mut self, supply: u256) {
+        assert!(self.heap.is_empty() && supply > 0)
+        self.supply = supply
+    }
+
+    /// Lots on sale.
+    pub fn supply(self) -> u256 {
+        self.supply
+    }
+
+    /// Total quantity asked for by the bids in the book.
+    pub fn demand(self) -> u256 {
+        self.demand
+    }
+
+    /// Number of bids in the book.
+    pub fn len(self) -> u256 {
+        self.heap.len()
+    }
+
+    /// Whether the bids in the book ask for every lot on sale.
+    pub fn is_full(self) -> bool {
+        self.demand >= self.supply
+    }
+
+    /// The marginal bid: the worst bid that still receives lots.
+    pub fn marginal(self) -> Option<Bid> {
+        self.heap.root()
+    }
+
+    /// Whether the bid with `id` is in the book.
+    pub fn contains(self, _ id: u64) -> bool {
+        self.in_book.get(key: id)
+    }
+
+    /// Adds a revealed bid. Returns `false` if the bid cannot win: the book
+    /// is full and the bid does not beat the marginal bid. Bids that no
+    /// longer receive lots leave the book, and each one emits [`Outbid`].
+    pub fn insert(mut self, _ bid: Bid) -> bool uses (log: mut Log) {
+        if self.demand >= self.supply {
+            // A full book only takes bids that beat its marginal bid. Any
+            // other bid would become the root and be evicted at once.
+            let marginal = self.heap.root().unwrap()
+            if !marginal.lt(bid) {
+                return false
+            }
+        }
+
+        self.heap.push(bid)
+        self.in_book.set(key: bid.id, value: true)
+        self.demand += bid.quantity as u256
+
+        // Restore the invariant: evict marginal bids while the bids above
+        // them cover the supply on their own. The new bid is never evicted
+        // here. If it is the root, the demand without it is the demand from
+        // before, which was below the supply.
+        while true {
+            let marginal = self.heap.root().unwrap()
+            let quantity = marginal.quantity as u256
+            if self.demand - quantity < self.supply {
+                break
+            }
+            let _ = self.heap.pop()
+            self.in_book.set(key: marginal.id, value: false)
+            self.demand -= quantity
+            log.emit(
+                Outbid { id: marginal.id, price: marginal.price, quantity: marginal.quantity },
+            )
+        }
+        true
+    }
+
+    /// Lots the bid receives if the auction ends now: its full quantity
+    /// above the margin, the remainder at the margin, nothing outside the
+    /// book.
+    pub fn allocation(self, _ bid: Bid) -> u256 {
+        if !self.contains(bid.id) {
+            return 0
+        }
+        let quantity = bid.quantity as u256
+        let marginal = self.heap.root().unwrap()
+        if marginal.id != bid.id {
+            return quantity
+        }
+        // The invariant makes the remainder positive.
+        let remainder = self.supply - (self.demand - quantity)
+        if remainder < quantity {
+            remainder
+        } else {
+            quantity
+        }
+    }
+
+    /// The uniform price every winner pays per lot: the marginal bid's
+    /// price when the bids cover the supply, the reserve price otherwise.
+    pub fn clearing_price(self, reserve: Wei) -> Wei {
+        if self.demand < self.supply {
+            return reserve
+        }
+        wei(self.heap.root().unwrap().price as u256)
+    }
+
+    /// Lots sold if the auction ends now.
+    pub fn sold(self) -> u256 {
+        if self.demand < self.supply {
+            self.demand
+        } else {
+            self.supply
+        }
+    }
+}

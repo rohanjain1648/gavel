@@ -1,0 +1,307 @@
+//! Random auctions checked against a reference implementation.
+//!
+//! Each trial draws a market and 16 bids from `KeccakRng` and lets four
+//! bidders commit them, with random deposits. It then reveals 7 in 8 of the
+//! bids in a shuffled order and settles everything. The streaming clearing
+//! book must agree with the textbook algorithm on every allocation and on
+//! the price: sort the revealed bids best first, hand out lots in that
+//! order, and charge the price of the last bid that received any. Every wei
+//! and every token must also end up where the reference says.
+//!
+//! Randomness is the `Rng` effect from `std::evm::random`, so each trial's
+//! draws, and with them its reveal order, follow from its seed alone.
+use core::sort::sort
+use std::evm::{Address, Evm, wei}
+use std::evm::random::{KeccakRng, Rng, shuffle}
+use ingot::auction::BPS
+use ingot::bid::Bid
+use ingot::tests::harness::{
+    LOT,
+    allocation,
+    book_size,
+    claim,
+    clearing_price,
+    commit,
+    cost,
+    demand,
+    is_winning,
+    new_bidder,
+    open_market,
+    received,
+    reveal,
+    sold,
+    to_reveal,
+    to_settled,
+    tokens_of,
+    withdraw_proceeds,
+}
+
+const BIDS: usize = 16
+const BIDDERS: usize = 4
+const RESERVE: u128 = 10
+const PENALTY_BPS: u256 = 500
+
+struct Draw { price: u128, quantity: u64, salt: u256, deposit: Wei, revealed: bool }
+
+impl Copy for Draw {}
+
+fn draw_bids(supply: u64, min_lots: u64) -> MemVec<Draw> uses (rng: mut Rng) {
+    var draws = MemVec<Draw>::new()
+    let span = supply as u256 - min_lots as u256
+    var i: usize = 0
+    while i < BIDS {
+        // A narrow price range, so ties at the margin are common.
+        let price: u128 = (RESERVE as u256 + rng.uniform(12)).downcast_truncate()
+        let quantity: u64 = (min_lots as u256 + rng.uniform(span / 2 + 1)).downcast_truncate()
+        let deposit = cost(price, quantity) + wei(rng.uniform(1000))
+        let revealed = rng.chance(numerator: 7, denominator: 8)
+        draws.push(
+                Draw { price, quantity, salt: rng.next(), deposit, revealed },
+            )
+        i += 1
+    }
+    draws
+}
+
+/// The textbook uniform-price auction: sort the revealed bids best first,
+/// hand out lots in that order, and charge the price of the last bid that
+/// received any (the reserve if the bids do not cover the supply).
+fn reference(_ draws: MemVec<Draw>, supply: u256, reserve: Wei) -> (MemVec<u256>, Wei) {
+    var revealed = MemVec<Bid>::new()
+    var allocations = MemVec<u256>::new()
+    var total: u256 = 0
+    var i: usize = 0
+    while i < BIDS {
+        let d = draws[i]
+        if d.revealed {
+            revealed.push(Bid { price: d.price, quantity: d.quantity, id: id_of(i) })
+            total += d.quantity as u256
+        }
+        allocations.push(0)
+        i += 1
+    }
+    // `Bid`'s order puts the worst bid first.
+    sort(mut revealed)
+
+    var remaining = supply
+    var marginal = reserve
+    var k = revealed.len()
+    while k > 0 {
+        k -= 1
+        let bid = revealed[k]
+        let wanted = bid.quantity as u256
+        let lots = if wanted < remaining {
+            wanted
+        } else {
+            remaining
+        }
+        if lots > 0 {
+            allocations[bid.id as usize] = lots
+            marginal = wei(bid.price as u256)
+        }
+        remaining -= lots
+    }
+    let price = if total >= supply { marginal } else { reserve }
+    (allocations, price)
+}
+
+fn run_trial(seed: u256) uses (evm: mut Evm, rng: mut Rng) {
+    let supply: u64 = (8 + rng.uniform(25)).downcast_truncate()
+    let min_lots: u64 = (1 + rng.uniform(3)).downcast_truncate()
+    let m = open_market(
+        supply,
+        min_lots,
+        reserve: wei(RESERVE as u256),
+        penalty_bps: PENALTY_BPS,
+    )
+    let max_winners = (supply as u256 + min_lots as u256 - 1) / min_lots as u256
+
+    var bidders = MemVec<Address>::new()
+    var b: usize = 0
+    while b < BIDDERS {
+        bidders.push(new_bidder())
+        b += 1
+    }
+
+    let draws = draw_bids(supply, min_lots)
+    var i: usize = 0
+    while i < BIDS {
+        let d = draws[i]
+        let id = commit(
+            m,
+            bidder: bidders[i % BIDDERS],
+            price: d.price,
+            quantity: d.quantity,
+            salt: d.salt,
+            deposit: d.deposit,
+        )
+        assert!(id == id_of(i))
+        i += 1
+    }
+
+    // Reveal in a random order, checking the book's invariants as it goes.
+    to_reveal(m)
+    var order: [u256; 16] = [0; 16]
+    var j: usize = 0
+    while j < BIDS {
+        order[j] = j as u256
+        j += 1
+    }
+    shuffle(mut order)
+    // `opened[r]`: bid r has been revealed. `ever_out[r]`: it was revealed
+    // and then seen outside the book at some point.
+    var opened = MemVec<bool>::new()
+    var ever_out = MemVec<bool>::new()
+    var n: usize = 0
+    while n < BIDS {
+        opened.push(false)
+        ever_out.push(false)
+        n += 1
+    }
+    var last_full_price = Wei::zero()
+    for slot in order {
+        let index = slot as usize
+        let d = draws[index]
+        if d.revealed {
+            let _ = reveal(
+                m,
+                id: id_of(index),
+                price: d.price,
+                quantity: d.quantity,
+                salt: d.salt,
+            )
+            opened[index] = true
+            assert!(book_size(m) <= max_winners)
+            if demand(m) >= supply as u256 {
+                let price = clearing_price(m)
+                assert!(price >= last_full_price)
+                last_full_price = price
+            }
+            var r: usize = 0
+            while r < BIDS {
+                if opened[r] && !ever_out[r] && !is_winning(m, id: id_of(r)) {
+                    ever_out[r] = true
+                }
+                r += 1
+            }
+        }
+    }
+
+    // A bid that was ever out of the book must get nothing in the end.
+    to_settled(m)
+    let (expected, price) = reference(
+        draws,
+        supply: supply as u256,
+        reserve: wei(RESERVE as u256),
+    )
+    assert!(clearing_price(m) == price)
+    var sold_lots: u256 = 0
+    var k: usize = 0
+    while k < BIDS {
+        assert!(allocation(m, id: id_of(k)) == expected[k])
+        if ever_out[k] {
+            assert!(expected[k] == 0)
+        }
+        sold_lots += expected[k]
+        k += 1
+    }
+    assert!(sold(m) == sold_lots)
+
+    // Pay everyone out and follow every wei.
+    var owed = MemVec<Wei>::new()
+    var o: usize = 0
+    while o < BIDDERS {
+        owed.push(Wei::zero())
+        o += 1
+    }
+    var penalties = Wei::zero()
+    var c: usize = 0
+    while c < BIDS {
+        let d = draws[c]
+        let lots = claim(m, id: id_of(c))
+        assert!(lots == expected[c])
+        let paid = if d.revealed {
+            price * lots
+        } else {
+            let penalty = d.deposit.mul_div(numerator: PENALTY_BPS, denominator: BPS)
+            penalties += penalty
+            penalty
+        }
+        owed[c % BIDDERS] = owed[c % BIDDERS] + (d.deposit - paid)
+        c += 1
+    }
+    var tokens_out: u256 = 0
+    var q: usize = 0
+    while q < BIDDERS {
+        assert!(received(bidders[q]) == owed[q])
+        tokens_out += tokens_of(m, bidders[q])
+        q += 1
+    }
+    assert!(tokens_out == sold_lots * LOT)
+
+    let proceeds = withdraw_proceeds(m)
+    assert!(proceeds == price * sold_lots + penalties)
+    assert!(received(m.seller) == proceeds)
+    assert!(
+        tokens_of(m, m.seller) == (supply as u256 - sold_lots) * LOT,
+    )
+    assert!(evm.balance(m.auction) == Wei::zero())
+    assert!(tokens_of(m, m.auction) == 0)
+    let _ = seed
+}
+
+fn run_trials(first: u256, count: u256) uses (evm: mut Evm) {
+    var seed = first
+    while seed < first + count {
+        var rng = KeccakRng::seeded(seed)
+        with (Rng = rng) {
+            run_trial(seed)
+        }
+        seed += 1
+    }
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_0_to_3() uses (evm: mut Evm) {
+    run_trials(first: 0, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_4_to_7() uses (evm: mut Evm) {
+    run_trials(first: 4, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_8_to_11() uses (evm: mut Evm) {
+    run_trials(first: 8, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_12_to_15() uses (evm: mut Evm) {
+    run_trials(first: 12, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_16_to_19() uses (evm: mut Evm) {
+    run_trials(first: 16, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_20_to_23() uses (evm: mut Evm) {
+    run_trials(first: 20, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_24_to_27() uses (evm: mut Evm) {
+    run_trials(first: 24, count: 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn differential_seeds_28_to_31() uses (evm: mut Evm) {
+    run_trials(first: 28, count: 4)
+}
+
+/// Bid ids are positions in the draw: commit ids count up from 0.
+fn id_of(_ index: usize) -> u64 {
+    index.downcast_truncate()
+}

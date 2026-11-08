@@ -1,0 +1,449 @@
+//! The auction's state machine: commitments, reveals, claims and the seller's
+//! proceeds.
+//!
+//! Every method here needs at most three effects: the immutable `Config`,
+//! a `Clock` and `Log`. None needs `Call` or `Ctx`, so the state machine
+//! cannot call other contracts, read the caller or move ETH or tokens. A
+//! method that pays someone returns a `Payout`, and the contract makes the
+//! transfer after the method has updated the state. The order of
+//! checks-effects-interactions follows from the effect types.
+use std::evm::{Address, StorageMap, wei}
+use ingot::bid::{Bid, commitment}
+use ingot::book::ClearingBook
+use ingot::clock::{Clock, Phase, Schedule}
+
+/// Basis points in 100%.
+pub const BPS: u256 = 10_000
+
+/// The auction's parameters. They are fixed at deployment and kept in the
+/// contract's code, so reading them costs no storage access.
+pub struct Config {
+    /// Receives the proceeds and any unsold lots.
+    pub seller: Address,
+    /// The ERC-20 token on sale.
+    pub token: Address,
+    /// Token base units in one lot.
+    pub lot_size: u256,
+    /// Lots on sale.
+    pub supply: u64,
+    /// The smallest bid, in lots. It caps the number of winners at
+    /// `ceil(supply / min_lots)`, and with it the size of the book.
+    pub min_lots: u64,
+    /// The lowest price per lot.
+    pub reserve: Wei,
+    /// Share of the deposit, in basis points, that a bid which was never
+    /// revealed forfeits to the seller.
+    pub penalty_bps: u256,
+    pub schedule: Schedule,
+    /// Chain and contract the commitments are bound to.
+    pub chain_id: u256,
+    pub auction: Address,
+}
+
+impl Copy for Config {}
+
+impl Config {
+    /// The largest number of bids the book can hold.
+    pub fn max_winners(self) -> u256 {
+        let supply = self.supply as u256
+        let min = self.min_lots as u256
+        (supply + min - 1) / min
+    }
+}
+
+/// The lifecycle of a bid. Storage reads an unknown id as the first variant.
+pub enum BidStatus {
+    Unknown,
+    Committed,
+    Revealed,
+    Claimed,
+}
+
+impl Copy for BidStatus {}
+
+impl BidStatus {
+    /// The status's ABI code: 0 unknown, 1 committed, 2 revealed, 3 claimed.
+    pub fn code(self) -> u8 {
+        match self {
+            BidStatus::Unknown => 0,
+            BidStatus::Committed => 1,
+            BidStatus::Revealed => 2,
+            BidStatus::Claimed => 3,
+        }
+    }
+}
+
+/// A bid as stored: four slots, with the bidder and status packed into the
+/// first slot and the revealed price and quantity into the second.
+pub struct BidRecord {
+    pub bidder: Address,
+    pub status: BidStatus,
+    pub price: u128,
+    pub quantity: u64,
+    pub deposit: Wei,
+    pub commitment: u256,
+}
+
+impl Copy for BidRecord {}
+
+/// What a claim pays out. The contract sends `refund` in ETH and
+/// `tokens` token base units to `to`.
+pub struct Payout {
+    pub to: Address,
+    pub lots: u256,
+    pub tokens: u256,
+    pub paid: Wei,
+    pub refund: Wei,
+}
+
+impl Copy for Payout {}
+
+/// What the seller receives: ETH proceeds and the unsold tokens.
+pub struct SellerPayout { pub to: Address, pub proceeds: Wei, pub unsold_tokens: u256 }
+
+impl Copy for SellerPayout {}
+
+// --- Errors ------------------------------------------------------------------
+
+/// The call is not allowed in the current phase (0 commit, 1 reveal, 2 settled).
+#[error]
+pub struct WrongPhase { pub expected: u8, pub current: u8 }
+
+#[error]
+pub struct AlreadyFunded {}
+
+/// Bids are only taken once the seller has deposited the lots.
+#[error]
+pub struct NotFunded {}
+
+#[error]
+pub struct EmptyDeposit {}
+
+#[error]
+pub struct UnknownBid { pub id: u64 }
+
+#[error]
+pub struct AlreadyRevealed { pub id: u64 }
+
+#[error]
+pub struct AlreadyClaimed { pub id: u64 }
+
+/// The revealed bid does not hash to the commitment.
+#[error]
+pub struct CommitmentMismatch { pub id: u64 }
+
+#[error]
+pub struct PriceBelowReserve { pub price: u128, pub reserve: Wei }
+
+#[error]
+pub struct QuantityOutOfRange { pub quantity: u64, pub min: u64, pub max: u64 }
+
+#[error]
+pub struct InsufficientDeposit { pub cost: Wei, pub deposit: Wei }
+
+// --- Events ------------------------------------------------------------------
+
+#[event]
+pub struct Funded {
+    #[indexed]
+    pub funder: Address,
+    pub lots: u256,
+    pub tokens: u256,
+}
+
+#[event]
+pub struct Committed {
+    #[indexed]
+    pub id: u64,
+    #[indexed]
+    pub bidder: Address,
+    pub deposit: Wei,
+    pub commitment: u256,
+}
+
+#[event]
+pub struct Revealed {
+    #[indexed]
+    pub id: u64,
+    pub price: u128,
+    pub quantity: u64,
+    pub in_book: bool,
+}
+
+#[event]
+pub struct Claimed {
+    #[indexed]
+    pub id: u64,
+    #[indexed]
+    pub bidder: Address,
+    pub lots: u256,
+    pub paid: Wei,
+    pub refund: Wei,
+}
+
+#[event]
+pub struct ProceedsWithdrawn { pub proceeds: Wei, pub unsold_tokens: u256 }
+
+// --- State -------------------------------------------------------------------
+
+pub struct Auction {
+    /// The id the next commitment receives.
+    next_id: u64,
+    funded: bool,
+    unsold_returned: bool,
+    /// Deposits forfeited by bids that were never revealed.
+    penalties: Wei,
+    /// What the seller has withdrawn so far.
+    withdrawn: Wei,
+    bids: StorageMap<u64, BidRecord>,
+    book: ClearingBook,
+}
+
+/// Reverts unless the auction is in `expected`.
+fn require_phase(_ expected: Phase) uses (config: Config, clock: Clock) {
+    let current = config.schedule.phase()
+    if current != expected {
+        revert_error(
+            WrongPhase { expected: expected.code(), current: current.code() },
+        )
+    }
+}
+
+impl Auction {
+    /// Prepares the book for `supply` lots.
+    pub fn open(mut self, supply: u256) {
+        self.book.open(supply)
+    }
+
+    // --- Seller --------------------------------------------------------------
+
+    /// Records that `funder` deposits the lots. Returns the token amount the
+    /// contract must pull from `funder`.
+    ///
+    /// Anyone may fund the auction, usually the seller. Funding only gives
+    /// tokens away, because every proceed and unsold lot goes to the seller.
+    pub fn fund(mut self, funder: Address) -> u256
+    uses (config: Config, clock: Clock, log: mut Log)
+    {
+        require_phase(Phase::Commit)
+        if self.funded {
+            revert_error(AlreadyFunded {})
+        }
+        self.funded = true
+        let lots = config.supply as u256
+        let tokens = lots * config.lot_size
+        log.emit(Funded { funder, lots, tokens })
+        tokens
+    }
+
+    /// Settles the seller's side: the proceeds earned since the last
+    /// withdrawal and, the first time, the unsold lots. Anyone may call it,
+    /// since the payout always goes to the seller.
+    pub fn withdraw_proceeds(mut self) -> SellerPayout
+    uses (config: Config, clock: Clock, log: mut Log)
+    {
+        require_phase(Phase::Settled)
+        let sold = self.book.sold()
+        let earned = self.book.clearing_price(reserve: config.reserve) * sold + self.penalties
+        let proceeds = earned - self.withdrawn
+        self.withdrawn = earned
+
+        var unsold_tokens: u256 = 0
+        if !self.unsold_returned {
+            self.unsold_returned = true
+            unsold_tokens = (config.supply as u256 - sold) * config.lot_size
+        }
+        log.emit(ProceedsWithdrawn { proceeds, unsold_tokens })
+        SellerPayout { to: config.seller, proceeds, unsold_tokens }
+    }
+
+    // --- Bidders -------------------------------------------------------------
+
+    /// Records a sealed bid and its deposit. Returns the bid's id.
+    ///
+    /// The deposit must cover the bid's cost when it is revealed. It may be
+    /// larger, which hides the bid's size behind any amount the bidder likes.
+    pub fn commit(mut self, bidder: Address, commitment: u256, deposit: Wei) -> u64
+    uses (config: Config, clock: Clock, log: mut Log)
+    {
+        require_phase(Phase::Commit)
+        if !self.funded {
+            revert_error(NotFunded {})
+        }
+        if deposit == Wei::zero() {
+            revert_error(EmptyDeposit {})
+        }
+        let id = self.next_id
+        self.next_id = id + 1
+        self.bids
+            .set(
+                key: id,
+                value: BidRecord {
+                    bidder,
+                    status: BidStatus::Committed,
+                    price: 0,
+                    quantity: 0,
+                    deposit,
+                    commitment,
+                },
+            )
+        log.emit(Committed { id, bidder, deposit, commitment })
+        id
+    }
+
+    /// Opens a commitment and enters the bid into the clearing book.
+    /// Returns whether the bid is in the book.
+    ///
+    /// Anyone who knows the opening may reveal it, for example a keeper
+    /// acting for the bidder: the commitment is bound to the bidder's
+    /// address, and every payout goes to that address.
+    pub fn reveal(mut self, id: u64, price: u128, quantity: u64, salt: u256) -> bool
+    uses (config: Config, clock: Clock, log: mut Log)
+    {
+        require_phase(Phase::Reveal)
+        var record = self.bids.get(key: id)
+        match record.status {
+            BidStatus::Committed => {},
+            BidStatus::Unknown => revert_error(UnknownBid { id }),
+            _ => revert_error(AlreadyRevealed { id }),
+        }
+        let expected = commitment(
+            chain_id: config.chain_id,
+            auction: config.auction,
+            bidder: record.bidder,
+            price,
+            quantity,
+            salt,
+        )
+        if expected != record.commitment {
+            revert_error(CommitmentMismatch { id })
+        }
+        if wei(price as u256) < config.reserve {
+            revert_error(PriceBelowReserve { price, reserve: config.reserve })
+        }
+        if quantity < config.min_lots || quantity > config.supply {
+            revert_error(
+                QuantityOutOfRange { quantity, min: config.min_lots, max: config.supply },
+            )
+        }
+        let bid = Bid { price, quantity, id }
+        let cost = bid.cost()
+        if cost > record.deposit {
+            revert_error(InsufficientDeposit { cost, deposit: record.deposit })
+        }
+
+        record.status = BidStatus::Revealed
+        record.price = price
+        record.quantity = quantity
+        record.commitment = 0
+        self.bids.set(key: id, value: record)
+
+        let in_book = self.book.insert(bid)
+        log.emit(Revealed { id, price, quantity, in_book })
+        in_book
+    }
+
+    /// Settles one bid and returns what it is owed. Anyone may claim for
+    /// any bid, since the payout always goes to the bidder.
+    ///
+    /// - A revealed bid that lost (it left the book or never entered it)
+    ///   gets its whole deposit back, as soon as the reveal phase has begun.
+    /// - Once the auction is settled, a winning bid receives its lots, pays
+    ///   the clearing price for each of them and gets the rest of its
+    ///   deposit back.
+    /// - Once the auction is settled, a bid that was never revealed gets its
+    ///   deposit back minus the penalty, which goes to the seller.
+    pub fn claim(mut self, id: u64) -> Payout
+    uses (config: Config, clock: Clock, log: mut Log)
+    {
+        var record = self.bids.get(key: id)
+        var lots: u256 = 0
+        var paid = Wei::zero()
+        match record.status {
+            BidStatus::Unknown => revert_error(UnknownBid { id }),
+            BidStatus::Claimed => revert_error(AlreadyClaimed { id }),
+            BidStatus::Committed => {
+                require_phase(Phase::Settled)
+                let penalty = record
+                    .deposit
+                    .mul_div(numerator: config.penalty_bps, denominator: BPS)
+                self.penalties += penalty
+                paid = penalty
+            },
+            BidStatus::Revealed => {
+                if self.book.contains(id) {
+                    require_phase(Phase::Settled)
+                    let bid = Bid { price: record.price, quantity: record.quantity, id }
+                    lots = self.book.allocation(bid)
+                    paid = self.book.clearing_price(reserve: config.reserve) * lots
+                } else {
+                    // Lost for good: a bid that leaves the book never returns.
+                    if config.schedule.phase() == Phase::Commit {
+                        revert_error(
+                            WrongPhase {
+                                expected: Phase::Reveal.code(),
+                                current: Phase::Commit.code(),
+                            },
+                        )
+                    }
+                }
+            },
+        }
+        let refund = record.deposit - paid
+        record.status = BidStatus::Claimed
+        self.bids.set(key: id, value: record)
+
+        log.emit(Claimed { id, bidder: record.bidder, lots, paid, refund })
+        Payout { to: record.bidder, lots, tokens: lots * config.lot_size, paid, refund }
+    }
+
+    // --- Views ---------------------------------------------------------------
+
+    pub fn bid(self, _ id: u64) -> BidRecord {
+        self.bids.get(key: id)
+    }
+
+    pub fn bid_count(self) -> u64 {
+        self.next_id
+    }
+
+    pub fn is_funded(self) -> bool {
+        self.funded
+    }
+
+    /// Whether the bid is currently in the clearing book (winning).
+    pub fn is_winning(self, _ id: u64) -> bool {
+        self.book.contains(id)
+    }
+
+    /// Lots the bid receives if the auction ends now.
+    pub fn allocation(self, _ id: u64) -> u256 {
+        let record = self.bids.get(key: id)
+        self.book.allocation(Bid { price: record.price, quantity: record.quantity, id })
+    }
+
+    /// The clearing price if the auction ends now.
+    pub fn clearing_price(self) -> Wei uses (config: Config) {
+        self.book.clearing_price(reserve: config.reserve)
+    }
+
+    pub fn demand(self) -> u256 {
+        self.book.demand()
+    }
+
+    pub fn sold(self) -> u256 {
+        self.book.sold()
+    }
+
+    pub fn book_size(self) -> u256 {
+        self.book.len()
+    }
+
+    /// The marginal bid's id and price, or `(false, 0, 0)` for an empty book.
+    pub fn marginal(self) -> (bool, u64, u128) {
+        match self.book.marginal() {
+            Option::Some(bid) => (true, bid.id, bid.price),
+            Option::None => (false, 0, 0),
+        }
+    }
+}

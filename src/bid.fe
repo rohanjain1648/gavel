@@ -1,0 +1,65 @@
+//! Bids, the order the clearing book keeps them in, and bid commitments.
+use core::ops::{Eq, Ord}
+use std::evm::{Address, keccak_words, wei}
+
+/// A revealed bid: `quantity` lots at `price` wei per lot.
+///
+/// The fields add up to exactly 256 bits, so Fe packs a `Bid` into one
+/// storage slot: every read or write the clearing heap makes is a single
+/// `SLOAD` or `SSTORE`.
+pub struct Bid { pub price: u128, pub quantity: u64, pub id: u64 }
+
+impl Copy for Bid {}
+
+impl Bid {
+    /// What the bid costs at its own price: the deposit it needs.
+    pub fn cost(self) -> Wei {
+        wei(self.price as u256) * (self.quantity as u256)
+    }
+}
+
+impl Eq for Bid {
+    fn eq(self, _ other: Bid) -> bool {
+        self.id == other.id && self.price == other.price && self.quantity == other.quantity
+    }
+}
+
+/// Bids are ordered by priority. A higher price beats a lower one, and
+/// between equal prices the earlier commitment (the lower id) wins, so the
+/// order is total over distinct bids and nobody gains by racing reveals.
+///
+/// `a < b` reads "a loses to b". In a min-heap of bids the root is
+/// therefore the marginal bid: the worst bid that still receives lots.
+impl Ord for Bid {
+    fn lt(self, _ other: Bid) -> bool {
+        self.price < other.price || (self.price == other.price && self.id > other.id)
+    }
+    fn le(self, _ other: Bid) -> bool {
+        !other.lt(self)
+    }
+    fn gt(self, _ other: Bid) -> bool {
+        other.lt(self)
+    }
+    fn ge(self, _ other: Bid) -> bool {
+        !self.lt(other)
+    }
+}
+
+/// The hash a bidder commits to:
+/// `keccak256(abi.encode(chainid, auction, bidder, price, quantity, salt))`.
+///
+/// Binding the chain, the auction and the bidder makes a commitment useless
+/// anywhere else. Copying another bidder's hash gains nothing, because the
+/// copy is checked against the copier's own address when it is revealed.
+pub fn commitment(
+    chain_id: u256,
+    auction: Address,
+    bidder: Address,
+    price: u128,
+    quantity: u64,
+    salt: u256,
+) -> u256 {
+    keccak_words(
+        [chain_id, auction.word(), bidder.word(), price as u256, quantity as u256, salt],
+    )
+}

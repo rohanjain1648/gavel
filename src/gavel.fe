@@ -1,0 +1,340 @@
+//! The `Gavel` contract: a sealed-bid, uniform-price batch auction for an
+//! ERC-20 token.
+//!
+//! The contract only wires effects together. Each handler supplies the
+//! block's clock to the [`Auction`] state machine. When the state machine
+//! returns a payout, the handler then moves the ETH or tokens, after the
+//! state is final. This module is the only part of the ingot with a `Call`
+//! effect.
+use std::evm::{Address, Call, Ctx, Log}
+use std::evm::erc20::{safe_transfer, safe_transfer_from}
+use ingot::auction::{Auction, BPS, Config, Payout, SellerPayout}
+use ingot::bid::commitment
+use ingot::clock::{BlockTime, Clock, Schedule}
+use ingot::token::Erc20Msg
+
+/// The auction's interface. The selectors are Solidity's, so `cast`, viem
+/// and ethers can call it with the signatures below.
+pub msg GavelMsg {
+    /// Deposits the lots from the caller (needs a prior ERC-20 approval).
+    #[selector = sol("fund()")]
+    Fund,
+    /// Submit a sealed bid; the value sent is the deposit. Returns the bid id.
+    #[selector = sol("commit(uint256)")]
+    Commit { commitment: u256 } -> u64,
+    /// Open a commitment. Returns whether the bid is winning.
+    #[selector = sol("reveal(uint64,uint128,uint64,uint256)")]
+    Reveal { id: u64, price: u128, quantity: u64, salt: u256 } -> bool,
+    /// Pay out a bid. Returns the lots it received.
+    #[selector = sol("claim(uint64)")]
+    Claim { id: u64 } -> u256,
+    /// Pays the seller the proceeds and the unsold lots.
+    #[selector = sol("withdrawProceeds()")]
+    WithdrawProceeds -> Wei,
+
+    #[selector = sol("phase()")]
+    CurrentPhase -> u8,
+    #[selector = sol("schedule()")]
+    GetSchedule -> (Timestamp, Timestamp),
+    #[selector = sol("clearingPrice()")]
+    ClearingPrice -> Wei,
+    #[selector = sol("demand()")]
+    Demand -> u256,
+    #[selector = sol("sold()")]
+    Sold -> u256,
+    #[selector = sol("bookSize()")]
+    BookSize -> u256,
+    #[selector = sol("marginal()")]
+    Marginal -> (bool, u64, u128),
+    #[selector = sol("bidCount()")]
+    BidCount -> u64,
+    #[selector = sol("bidOf(uint64)")]
+    BidOf { id: u64 } -> (Address, u8, u128, u64, Wei),
+    #[selector = sol("isWinning(uint64)")]
+    IsWinning { id: u64 } -> bool,
+    #[selector = sol("allocation(uint64)")]
+    Allocation { id: u64 } -> u256,
+    /// Helper for clients and tests. Calling it through a public RPC node
+    /// shows the bid to that node, so compute commitments locally instead.
+    #[selector = sol("commitmentOf(address,uint128,uint64,uint256)")]
+    CommitmentOf { bidder: Address, price: u128, quantity: u64, salt: u256 } -> u256,
+}
+
+/// An ETH payout failed. The state change that owed it is rolled back.
+#[error]
+pub struct EthTransferFailed { pub to: Address, pub amount: Wei }
+
+/// The token delivered fewer lots than were transferred, as fee-on-transfer
+/// and rebasing tokens do. Such a token cannot be auctioned: the auction
+/// would owe more lots than it holds.
+#[error]
+pub struct TokenShortfall { pub expected: u256, pub received: u256 }
+
+/// The most bids the clearing book may hold, `ceil(supply / min_lots)`.
+///
+/// One reveal can evict at most this many bids, at about 15,000 gas each,
+/// so the cap keeps the worst-case reveal near 4 million gas. Without the
+/// cap, a flood of tiny bids could make an honest bidder's reveal too
+/// expensive to send.
+pub const MAX_WINNERS: u256 = 256
+
+/// Checks the deployment parameters and fixes the schedule from the current
+/// block.
+pub fn configure(
+    seller: Address,
+    token: Address,
+    lot_size: u256,
+    supply: u64,
+    min_lots: u64,
+    reserve: Wei,
+    penalty_bps: u256,
+    commit_period: Duration,
+    reveal_period: Duration,
+) -> Config
+uses (ctx: Ctx)
+{
+    assert!(seller != Address::zero(), "seller is zero")
+    assert!(token != Address::zero(), "token is zero")
+    assert!(lot_size > 0, "lot size is zero")
+    assert!(supply > 0, "supply is zero")
+    assert!(
+        min_lots > 0 && min_lots <= supply,
+        "min lots out of range",
+    )
+    assert!(reserve > Wei::zero(), "reserve is zero")
+    assert!(penalty_bps <= BPS, "penalty above 100%")
+    assert!(
+        commit_period > Duration::zero() && reveal_period > Duration::zero(),
+        "empty phase",
+    )
+    // Checked arithmetic: the token amount of the whole supply must fit.
+    let _ = (supply as u256) * lot_size
+    let config = Config {
+        seller,
+        token,
+        lot_size,
+        supply,
+        min_lots,
+        reserve,
+        penalty_bps,
+        schedule: Schedule::starting(
+            now: ctx.timestamp(),
+            commit: commit_period,
+            reveal: reveal_period,
+        ),
+        chain_id: ctx.chainid(),
+        auction: ctx.address(),
+    }
+    assert!(
+        config.max_winners() <= MAX_WINNERS,
+        "too many possible winners: raise min lots",
+    )
+    config
+}
+
+// --- Handlers shared by every contract that hosts an `Auction` ---------------
+//
+// They need a `Clock`, and the contract decides which one: `Gavel` gives
+// them the block's timestamp, the test harness a clock it can move.
+
+pub fn handle_fund()
+uses (ctx: Ctx, call: mut Call, config: Config, auction: mut Auction, clock: Clock, log: mut Log)
+{
+    let funder = ctx.caller()
+    let tokens = auction.fund(funder)
+    let here = ctx.address()
+    let before = token_balance(token: config.token, of: here)
+    safe_transfer_from(
+        token: config.token,
+        owner: funder,
+        receiver: here,
+        amount: tokens,
+    )
+    let received = token_balance(token: config.token, of: here) - before
+    if received != tokens {
+        revert_error(TokenShortfall { expected: tokens, received })
+    }
+}
+
+fn token_balance(token: Address, of: Address) -> u256
+uses (ctx: Ctx, call: mut Call)
+{
+    call.static(
+        addr: token,
+        gas: ctx.gas(),
+        message: Erc20Msg::BalanceOf { account: of },
+    )
+}
+
+pub fn handle_claim(_ id: u64) -> u256
+uses (ctx: Ctx, call: mut Call, config: Config, auction: mut Auction, clock: Clock, log: mut Log)
+{
+    let payout: Payout = auction.claim(id)
+    if payout.tokens > 0 {
+        safe_transfer(
+            token: config.token,
+            receiver: payout.to,
+            amount: payout.tokens,
+        )
+    }
+    send_eth(to: payout.to, amount: payout.refund)
+    payout.lots
+}
+
+pub fn handle_withdraw_proceeds() -> Wei
+uses (ctx: Ctx, call: mut Call, config: Config, auction: mut Auction, clock: Clock, log: mut Log)
+{
+    let payout: SellerPayout = auction.withdraw_proceeds()
+    if payout.unsold_tokens > 0 {
+        safe_transfer(
+            token: config.token,
+            receiver: payout.to,
+            amount: payout.unsold_tokens,
+        )
+    }
+    send_eth(to: payout.to, amount: payout.proceeds)
+    payout.proceeds
+}
+
+/// Sends ETH with all remaining gas, so smart-contract wallets can receive
+/// it. Reentrancy finds the state already final: every caller updates the
+/// state before it pays.
+fn send_eth(to: Address, amount: Wei) uses (ctx: Ctx, call: mut Call) {
+    if amount == Wei::zero() {
+        return
+    }
+    if !call.send_value(addr: to, gas: ctx.gas(), value: amount).success() {
+        revert_error(EthTransferFailed { to, amount })
+    }
+}
+
+// --- The contract ------------------------------------------------------------
+
+pub contract Gavel uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    config: Config,
+    mut auction: Auction,
+
+    init(
+        seller: Address,
+        token: Address,
+        lot_size: u256,
+        supply: u64,
+        min_lots: u64,
+        reserve: Wei,
+        penalty_bps: u256,
+        commit_period: Duration,
+        reveal_period: Duration,
+    )
+    uses (ctx, mut config, mut auction)
+    {
+        config = configure(
+            seller,
+            token,
+            lot_size,
+            supply,
+            min_lots,
+            reserve,
+            penalty_bps,
+            commit_period,
+            reveal_period,
+        )
+        auction.open(supply: supply as u256)
+    }
+
+    recv GavelMsg {
+        Fund uses (ctx, mut call, config, mut auction, mut log) {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                handle_fund()
+            }
+        }
+
+        #[payable]
+        Commit { commitment } -> u64 uses (ctx, config, mut auction, mut log) {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                auction.commit(bidder: ctx.caller(), commitment, deposit: ctx.value())
+            }
+        }
+
+        Reveal { id, price, quantity, salt } -> bool
+        uses (ctx, config, mut auction, mut log)
+        {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                auction.reveal(id, price, quantity, salt)
+            }
+        }
+
+        Claim { id } -> u256 uses (ctx, mut call, config, mut auction, mut log) {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                handle_claim(id)
+            }
+        }
+
+        WithdrawProceeds -> Wei uses (ctx, mut call, config, mut auction, mut log) {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                handle_withdraw_proceeds()
+            }
+        }
+
+        CurrentPhase -> u8 uses (ctx, config) {
+            with (Clock = BlockTime::at(ctx.timestamp())) {
+                config.schedule.phase().code()
+            }
+        }
+
+        GetSchedule -> (Timestamp, Timestamp) uses (config) {
+            (config.schedule.commit_end, config.schedule.reveal_end)
+        }
+
+        ClearingPrice -> Wei uses (config, auction) {
+            auction.clearing_price()
+        }
+
+        Demand -> u256 uses (auction) {
+            auction.demand()
+        }
+
+        Sold -> u256 uses (auction) {
+            auction.sold()
+        }
+
+        BookSize -> u256 uses (auction) {
+            auction.book_size()
+        }
+
+        Marginal -> (bool, u64, u128) uses (auction) {
+            auction.marginal()
+        }
+
+        BidCount -> u64 uses (auction) {
+            auction.bid_count()
+        }
+
+        BidOf { id } -> (Address, u8, u128, u64, Wei)
+        uses (auction)
+        {
+            let record = auction.bid(id)
+            (record.bidder, record.status.code(), record.price, record.quantity, record.deposit)
+        }
+
+        IsWinning { id } -> bool uses (auction) {
+            auction.is_winning(id)
+        }
+
+        Allocation { id } -> u256 uses (auction) {
+            auction.allocation(id)
+        }
+
+        CommitmentOf { bidder, price, quantity, salt } -> u256
+        uses (config)
+        {
+            commitment(
+                chain_id: config.chain_id,
+                auction: config.auction,
+                bidder,
+                price,
+                quantity,
+                salt,
+            )
+        }
+    }
+}

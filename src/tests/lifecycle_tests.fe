@@ -1,0 +1,332 @@
+//! Complete auctions, from funding to the last payout.
+use std::evm::Evm
+use ingot::tests::harness::{
+    LOT,
+    allocation,
+    book_size,
+    claim,
+    clearing_price,
+    commit,
+    commit_exact,
+    cost,
+    is_winning,
+    new_bidder,
+    open_market,
+    phase,
+    received,
+    reveal,
+    sold,
+    status,
+    to_reveal,
+    to_settled,
+    tokens_of,
+    withdraw_proceeds,
+}
+
+/// 0.001 ether: prices in these tests are multiples of it.
+const MILLI: u128 = 1_000_000_000_000_000
+
+fn milli(_ n: u256) -> Wei {
+    std::evm::wei(n * MILLI as u256)
+}
+
+/// Four bidders for ten lots. The last reveal pushes the lowest bid out
+/// of the book, and the marginal bid is filled partially.
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn oversubscribed_auction_end_to_end() uses (evm: mut Evm) {
+    let market = open_market(
+        supply: 10,
+        min_lots: 1,
+        reserve: milli(1),
+        penalty_bps: 1000,
+    )
+    assert!(tokens_of(market, market.auction) == 10 * LOT)
+    assert!(phase(market) == 0)
+
+    let alice = new_bidder()
+    let bob = new_bidder()
+    let carol = new_bidder()
+    let dave = new_bidder()
+    let a = commit_exact(
+        market,
+        bidder: alice,
+        price: 10 * MILLI,
+        quantity: 4,
+        salt: 11,
+    )
+    let b = commit_exact(
+        market,
+        bidder: bob,
+        price: 8 * MILLI,
+        quantity: 4,
+        salt: 22,
+    )
+    let c = commit_exact(
+        market,
+        bidder: carol,
+        price: 6 * MILLI,
+        quantity: 4,
+        salt: 33,
+    )
+    // Dave hides the size of his bid behind twice its cost.
+    let d = commit(
+        market,
+        bidder: dave,
+        price: 9 * MILLI,
+        quantity: 3,
+        salt: 44,
+        deposit: milli(54),
+    )
+    assert!(a == 0 && b == 1 && c == 2 && d == 3)
+    assert!(evm.balance(market.auction) == milli(40 + 32 + 24 + 54))
+
+    to_reveal(market)
+    assert!(phase(market) == 1)
+    assert!(
+        reveal(market, id: c, price: 6 * MILLI, quantity: 4, salt: 33),
+    )
+    assert!(
+        reveal(market, id: a, price: 10 * MILLI, quantity: 4, salt: 11),
+    )
+    assert!(
+        reveal(market, id: b, price: 8 * MILLI, quantity: 4, salt: 22),
+    )
+    // Twelve lots asked for ten: carol's bid at 6 is the margin, with 2 lots.
+    assert!(clearing_price(market) == milli(6))
+    assert!(allocation(market, id: c) == 2)
+    // Dave's 9 beats carol's 6, which no longer gets any lots.
+    assert!(
+        reveal(market, id: d, price: 9 * MILLI, quantity: 3, salt: 44),
+    )
+    assert!(!is_winning(market, id: c))
+    assert!(clearing_price(market) == milli(8))
+    assert!(book_size(market) == 3)
+
+    // Carol has lost for good and takes her deposit back before the end.
+    assert!(claim(market, id: c) == 0)
+    assert!(received(carol) == milli(24))
+    assert!(status(market, id: c) == 3)
+
+    to_settled(market)
+    assert!(phase(market) == 2)
+    assert!(sold(market) == 10)
+    assert!(allocation(market, id: a) == 4)
+    assert!(allocation(market, id: d) == 3)
+    assert!(allocation(market, id: b) == 3)
+
+    // Everyone pays the uniform price of 8 per lot.
+    assert!(claim(market, id: a) == 4)
+    assert!(claim(market, id: b) == 3)
+    assert!(claim(market, id: d) == 3)
+    assert!(tokens_of(market, alice) == 4 * LOT)
+    assert!(tokens_of(market, bob) == 3 * LOT)
+    assert!(tokens_of(market, dave) == 3 * LOT)
+    assert!(received(alice) == milli(40 - 32))
+    assert!(received(bob) == milli(32 - 24))
+    assert!(received(dave) == milli(54 - 24))
+
+    assert!(withdraw_proceeds(market) == milli(80))
+    assert!(received(market.seller) == milli(80))
+    assert!(tokens_of(market, market.seller) == 0)
+
+    // Nothing is left behind.
+    assert!(evm.balance(market.auction) == Wei::zero())
+    assert!(tokens_of(market, market.auction) == 0)
+}
+
+/// Less demand than supply: every bid wins at the reserve price and the
+/// seller gets the unsold lots back.
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn undersubscribed_auction_clears_at_the_reserve() uses (evm: mut Evm) {
+    let market = open_market(supply: 10, min_lots: 1, reserve: milli(2), penalty_bps: 0)
+    let alice = new_bidder()
+    let bob = new_bidder()
+    let a = commit_exact(
+        market,
+        bidder: alice,
+        price: 5 * MILLI,
+        quantity: 3,
+        salt: 1,
+    )
+    let b = commit_exact(
+        market,
+        bidder: bob,
+        price: 7 * MILLI,
+        quantity: 2,
+        salt: 2,
+    )
+    to_reveal(market)
+    assert!(
+        reveal(market, id: a, price: 5 * MILLI, quantity: 3, salt: 1),
+    )
+    assert!(
+        reveal(market, id: b, price: 7 * MILLI, quantity: 2, salt: 2),
+    )
+    to_settled(market)
+    assert!(clearing_price(market) == milli(2))
+    assert!(sold(market) == 5)
+
+    assert!(claim(market, id: a) == 3)
+    assert!(claim(market, id: b) == 2)
+    assert!(received(alice) == milli(15 - 6))
+    assert!(received(bob) == milli(14 - 4))
+
+    assert!(withdraw_proceeds(market) == milli(10))
+    assert!(received(market.seller) == milli(10))
+    assert!(tokens_of(market, market.seller) == 5 * LOT)
+    assert!(evm.balance(market.auction) == Wei::zero())
+    assert!(tokens_of(market, market.auction) == 0)
+}
+
+/// A bid that is never revealed pays the penalty to the seller, and the
+/// seller can withdraw again when it arrives after the first withdrawal.
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn unrevealed_bid_pays_the_penalty() uses (evm: mut Evm) {
+    let market = open_market(
+        supply: 5,
+        min_lots: 1,
+        reserve: milli(1),
+        penalty_bps: 1000,
+    )
+    let alice = new_bidder()
+    let eve = new_bidder()
+    let a = commit_exact(
+        market,
+        bidder: alice,
+        price: 3 * MILLI,
+        quantity: 5,
+        salt: 7,
+    )
+    let e = commit(
+        market,
+        bidder: eve,
+        price: 4 * MILLI,
+        quantity: 5,
+        salt: 8,
+        deposit: milli(50),
+    )
+    to_reveal(market)
+    assert!(
+        reveal(market, id: a, price: 3 * MILLI, quantity: 5, salt: 7),
+    )
+    to_settled(market)
+
+    assert!(claim(market, id: a) == 5)
+    assert!(withdraw_proceeds(market) == milli(15))
+
+    // Anyone can settle Eve's bid. She gets 90% back and the seller 10%.
+    assert!(claim(market, id: e) == 0)
+    assert!(received(eve) == milli(45))
+    assert!(withdraw_proceeds(market) == milli(5))
+    assert!(withdraw_proceeds(market) == Wei::zero())
+    assert!(received(market.seller) == milli(20))
+    assert!(evm.balance(market.auction) == Wei::zero())
+}
+
+/// An auction nobody bids in returns every lot to the seller.
+#[test]
+fn auction_without_bids_returns_the_lots() uses (evm: mut Evm) {
+    let market = open_market(supply: 8, min_lots: 2, reserve: milli(1), penalty_bps: 0)
+    to_reveal(market)
+    to_settled(market)
+    assert!(clearing_price(market) == milli(1))
+    assert!(withdraw_proceeds(market) == Wei::zero())
+    assert!(tokens_of(market, market.seller) == 8 * LOT)
+    // The unsold lots are returned only once.
+    assert!(withdraw_proceeds(market) == Wei::zero())
+    assert!(tokens_of(market, market.seller) == 8 * LOT)
+    assert!(tokens_of(market, market.auction) == 0)
+}
+
+/// A rejected reveal (worse than the margin of a full book) is refundable
+/// at once, like an evicted one.
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn rejected_bid_is_refunded_during_the_reveal() uses (evm: mut Evm) {
+    let market = open_market(
+        supply: 4,
+        min_lots: 1,
+        reserve: milli(1),
+        penalty_bps: 500,
+    )
+    let alice = new_bidder()
+    let bob = new_bidder()
+    let a = commit_exact(
+        market,
+        bidder: alice,
+        price: 9 * MILLI,
+        quantity: 4,
+        salt: 1,
+    )
+    let b = commit_exact(
+        market,
+        bidder: bob,
+        price: 2 * MILLI,
+        quantity: 2,
+        salt: 2,
+    )
+    to_reveal(market)
+    assert!(
+        reveal(market, id: a, price: 9 * MILLI, quantity: 4, salt: 1),
+    )
+    assert!(
+        !reveal(market, id: b, price: 2 * MILLI, quantity: 2, salt: 2),
+    )
+    assert!(claim(market, id: b) == 0)
+    assert!(received(bob) == cost(2 * MILLI, 2))
+    to_settled(market)
+    assert!(claim(market, id: a) == 4)
+    assert!(received(alice) == Wei::zero())
+    assert!(withdraw_proceeds(market) == milli(36))
+}
+
+/// The same bidder may place several bids; each is settled on its own.
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn one_bidder_with_several_bids() uses (evm: mut Evm) {
+    let market = open_market(supply: 6, min_lots: 1, reserve: milli(1), penalty_bps: 0)
+    let alice = new_bidder()
+    let bob = new_bidder()
+    let a1 = commit_exact(
+        market,
+        bidder: alice,
+        price: 9 * MILLI,
+        quantity: 2,
+        salt: 1,
+    )
+    let a2 = commit_exact(
+        market,
+        bidder: alice,
+        price: 4 * MILLI,
+        quantity: 4,
+        salt: 2,
+    )
+    let b = commit_exact(
+        market,
+        bidder: bob,
+        price: 6 * MILLI,
+        quantity: 3,
+        salt: 3,
+    )
+    to_reveal(market)
+    assert!(
+        reveal(market, id: a1, price: 9 * MILLI, quantity: 2, salt: 1),
+    )
+    assert!(
+        reveal(market, id: a2, price: 4 * MILLI, quantity: 4, salt: 2),
+    )
+    assert!(
+        reveal(market, id: b, price: 6 * MILLI, quantity: 3, salt: 3),
+    )
+    to_settled(market)
+    // 2 + 3 lots above the margin, 1 lot for Alice's second bid at 4.
+    assert!(clearing_price(market) == milli(4))
+    assert!(claim(market, id: a1) + claim(market, id: a2) == 3)
+    assert!(claim(market, id: b) == 3)
+    assert!(
+        tokens_of(market, alice) == 3 * LOT && tokens_of(market, bob) == 3 * LOT,
+    )
+    // Alice paid 3 lots at 4 out of 18 + 16 deposited.
+    assert!(received(alice) == milli(34 - 12))
+    assert!(received(bob) == milli(18 - 12))
+    assert!(withdraw_proceeds(market) == milli(24))
+    assert!(evm.balance(market.auction) == Wei::zero())
+}

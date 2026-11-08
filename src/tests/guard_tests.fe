@@ -1,0 +1,513 @@
+//! Every phase check and validation error, each with the custom error the
+//! auction reverts with.
+use std::evm::{Address, CallOutcome, Evm, wei}
+use std::evm::returndata::is_error
+use ingot::auction::{
+    AlreadyClaimed,
+    AlreadyFunded,
+    AlreadyRevealed,
+    CommitmentMismatch,
+    EmptyDeposit,
+    InsufficientDeposit,
+    NotFunded,
+    PriceBelowReserve,
+    QuantityOutOfRange,
+    UnknownBid,
+    WrongPhase,
+}
+use ingot::gavel::GavelMsg
+use ingot::tests::harness::{
+    GAS,
+    Market,
+    approve,
+    claim,
+    commit,
+    commit_exact,
+    cost,
+    deploy_market,
+    new_bidder,
+    open_market,
+    reveal,
+    sealed,
+    to_reveal,
+    to_settled,
+}
+
+fn try_commit(_ market: Market, commitment: u256, deposit: Wei) -> CallOutcome
+uses (evm: mut Evm)
+{
+    evm.try_call(
+        addr: market.auction,
+        gas: GAS,
+        value: deposit,
+        message: GavelMsg::Commit { commitment },
+    )
+}
+
+fn try_reveal(_ market: Market, id: u64, price: u128, quantity: u64, salt: u256) -> CallOutcome
+uses (evm: mut Evm)
+{
+    evm.try_call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Reveal { id, price, quantity, salt },
+    )
+}
+
+fn try_claim(_ market: Market, id: u64) -> CallOutcome uses (evm: mut Evm) {
+    evm.try_call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Claim { id },
+    )
+}
+
+fn try_fund(_ market: Market) -> CallOutcome uses (evm: mut Evm) {
+    evm.try_call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::Fund {},
+    )
+}
+
+fn try_withdraw(_ market: Market) -> CallOutcome uses (evm: mut Evm) {
+    evm.try_call(
+        addr: market.auction,
+        gas: GAS,
+        value: Wei::zero(),
+        message: GavelMsg::WithdrawProceeds {},
+    )
+}
+
+/// Word `i` of the error's ABI payload.
+fn field(_ outcome: CallOutcome, _ i: u256) -> u256 {
+    outcome.returndata().word_at(4 + 32 * i)
+}
+
+fn wrong_phase(_ outcome: CallOutcome, expected: u256, current: u256) -> bool {
+    !outcome.success()
+        && is_error<WrongPhase>(outcome.returndata())
+        && field(outcome, 0) == expected
+        && field(outcome, 1) == current
+}
+
+fn market() -> Market uses (evm: mut Evm) {
+    open_market(
+        supply: 10,
+        min_lots: 2,
+        reserve: wei(100),
+        penalty_bps: 1000,
+    )
+}
+
+// --- Funding -----------------------------------------------------------------
+
+#[test]
+fn commit_before_funding_is_rejected() uses (evm: mut Evm) {
+    let m = deploy_market(supply: 10, min_lots: 2, reserve: wei(100), penalty_bps: 0)
+    let outcome = try_commit(m, commitment: 1, deposit: Wei::zero())
+    assert!(is_error<NotFunded>(outcome.returndata()))
+}
+
+#[test]
+fn funding_twice_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    approve(m, amount: 10 * ingot::tests::harness::LOT)
+    assert!(is_error<AlreadyFunded>(try_fund(m).returndata()))
+}
+
+#[test]
+fn funding_after_the_commit_phase_is_rejected() uses (evm: mut Evm) {
+    let m = deploy_market(supply: 10, min_lots: 2, reserve: wei(100), penalty_bps: 0)
+    approve(m, amount: 10 * ingot::tests::harness::LOT)
+    to_reveal(m)
+    assert!(wrong_phase(try_fund(m), expected: 0, current: 1))
+}
+
+#[test]
+fn funding_without_allowance_reverts() uses (evm: mut Evm) {
+    let m = deploy_market(supply: 10, min_lots: 2, reserve: wei(100), penalty_bps: 0)
+    assert!(!try_fund(m).success())
+}
+
+// --- Commit ------------------------------------------------------------------
+
+#[test]
+fn commit_needs_a_deposit() uses (evm: mut Evm) {
+    let m = market()
+    assert!(
+        is_error<EmptyDeposit>(
+            try_commit(m, commitment: 1, deposit: Wei::zero()).returndata(),
+        ),
+    )
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn commit_after_the_commit_phase_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    to_reveal(m)
+    assert!(
+        wrong_phase(
+            try_commit(m, commitment: 1, deposit: wei(1000)),
+            expected: 0,
+            current: 1,
+        ),
+    )
+    to_settled(m)
+    assert!(
+        wrong_phase(
+            try_commit(m, commitment: 1, deposit: wei(1000)),
+            expected: 0,
+            current: 2,
+        ),
+    )
+}
+
+// --- Reveal ------------------------------------------------------------------
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_outside_the_reveal_phase_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    assert!(
+        wrong_phase(
+            try_reveal(m, id, price: 100, quantity: 2, salt: 5),
+            expected: 1,
+            current: 0,
+        ),
+    )
+    to_reveal(m)
+    to_settled(m)
+    assert!(
+        wrong_phase(
+            try_reveal(m, id, price: 100, quantity: 2, salt: 5),
+            expected: 1,
+            current: 2,
+        ),
+    )
+}
+
+#[test]
+fn reveal_of_an_unknown_bid_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    to_reveal(m)
+    let outcome = try_reveal(m, id: 42, price: 100, quantity: 2, salt: 5)
+    assert!(
+        is_error<UnknownBid>(outcome.returndata()) && field(outcome, 0) == 42,
+    )
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_twice_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    to_reveal(m)
+    assert!(reveal(m, id, price: 100, quantity: 2, salt: 5))
+    let outcome = try_reveal(m, id, price: 100, quantity: 2, salt: 5)
+    assert!(
+        is_error<AlreadyRevealed>(outcome.returndata()) && field(outcome, 0) == id as u256,
+    )
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_with_a_different_opening_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    to_reveal(m)
+    assert!(
+        is_error<CommitmentMismatch>(
+            try_reveal(m, id, price: 100, quantity: 2, salt: 6).returndata(),
+        ),
+    )
+    assert!(
+        is_error<CommitmentMismatch>(
+            try_reveal(m, id, price: 101, quantity: 2, salt: 5).returndata(),
+        ),
+    )
+    assert!(
+        is_error<CommitmentMismatch>(
+            try_reveal(m, id, price: 100, quantity: 3, salt: 5).returndata(),
+        ),
+    )
+    // The right opening still works afterwards.
+    assert!(reveal(m, id, price: 100, quantity: 2, salt: 5))
+}
+
+/// Eve copies Alice's commitment during the commit phase and waits for
+/// Alice's reveal to learn the opening. Commitments are bound to the bidder,
+/// so the copy cannot be opened.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn copied_commitment_cannot_be_opened() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let eve = new_bidder()
+    let a = commit_exact(m, bidder: alice, price: 500, quantity: 4, salt: 77)
+    let copy = sealed(m, bidder: alice, price: 500, quantity: 4, salt: 77)
+    let e: u64 = evm
+        .call(
+            addr: eve,
+            gas: GAS,
+            value: cost(500, 4),
+            message: ingot::tests::harness::BidderMsg::Commit {
+                auction: m.auction,
+                commitment: copy,
+            },
+        )
+    to_reveal(m)
+    assert!(reveal(m, id: a, price: 500, quantity: 4, salt: 77))
+    let outcome = try_reveal(m, id: e, price: 500, quantity: 4, salt: 77)
+    assert!(
+        is_error<CommitmentMismatch>(outcome.returndata()) && field(outcome, 0) == e as u256,
+    )
+}
+
+/// The same commitment opened on another auction fails: the hash includes
+/// the auction's address.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn commitment_is_bound_to_its_auction() uses (evm: mut Evm) {
+    let one = market()
+    let two = market()
+    let alice = new_bidder()
+    let c = sealed(one, bidder: alice, price: 100, quantity: 2, salt: 5)
+    let id: u64 = evm
+        .call(
+            addr: alice,
+            gas: GAS,
+            value: cost(100, 2),
+            message: ingot::tests::harness::BidderMsg::Commit {
+                auction: two.auction,
+                commitment: c,
+            },
+        )
+    to_reveal(two)
+    assert!(
+        is_error<CommitmentMismatch>(
+            try_reveal(two, id, price: 100, quantity: 2, salt: 5).returndata(),
+        ),
+    )
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_below_the_reserve_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 99, quantity: 2, salt: 5)
+    to_reveal(m)
+    let outcome = try_reveal(m, id, price: 99, quantity: 2, salt: 5)
+    assert!(is_error<PriceBelowReserve>(outcome.returndata()))
+    assert!(field(outcome, 0) == 99 && field(outcome, 1) == 100)
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_with_a_quantity_out_of_range_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let small = commit_exact(m, bidder: alice, price: 100, quantity: 1, salt: 1)
+    let large = commit_exact(m, bidder: alice, price: 100, quantity: 11, salt: 2)
+    to_reveal(m)
+    let outcome = try_reveal(m, id: small, price: 100, quantity: 1, salt: 1)
+    assert!(is_error<QuantityOutOfRange>(outcome.returndata()))
+    assert!(
+        field(outcome, 0) == 1 && field(outcome, 1) == 2 && field(outcome, 2) == 10,
+    )
+    assert!(
+        is_error<QuantityOutOfRange>(
+            try_reveal(m, id: large, price: 100, quantity: 11, salt: 2).returndata(),
+        ),
+    )
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_that_the_deposit_does_not_cover_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit(
+        m,
+        bidder: alice,
+        price: 100,
+        quantity: 3,
+        salt: 5,
+        deposit: wei(299),
+    )
+    to_reveal(m)
+    let outcome = try_reveal(m, id, price: 100, quantity: 3, salt: 5)
+    assert!(is_error<InsufficientDeposit>(outcome.returndata()))
+    assert!(field(outcome, 0) == 300 && field(outcome, 1) == 299)
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn reveal_is_not_payable() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    to_reveal(m)
+    let outcome = evm
+        .try_call(
+            addr: m.auction,
+            gas: GAS,
+            value: wei(1),
+            message: GavelMsg::Reveal { id, price: 100, quantity: 2, salt: 5 },
+        )
+    assert!(!outcome.success())
+}
+
+// --- Claim -------------------------------------------------------------------
+
+#[test]
+fn claim_of_an_unknown_bid_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    to_reveal(m)
+    to_settled(m)
+    assert!(is_error<UnknownBid>(try_claim(m, id: 3).returndata()))
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn winner_cannot_claim_before_the_end() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    assert!(wrong_phase(try_claim(m, id), expected: 2, current: 0))
+    to_reveal(m)
+    assert!(reveal(m, id, price: 100, quantity: 2, salt: 5))
+    assert!(wrong_phase(try_claim(m, id), expected: 2, current: 1))
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn unrevealed_bid_cannot_claim_before_the_end() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    to_reveal(m)
+    assert!(wrong_phase(try_claim(m, id), expected: 2, current: 1))
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn claim_twice_is_rejected() uses (evm: mut Evm) {
+    let m = market()
+    let alice = new_bidder()
+    let id = commit_exact(m, bidder: alice, price: 100, quantity: 2, salt: 5)
+    to_reveal(m)
+    assert!(reveal(m, id, price: 100, quantity: 2, salt: 5))
+    to_settled(m)
+    assert!(claim(m, id) == 2)
+    let outcome = try_claim(m, id)
+    assert!(
+        is_error<AlreadyClaimed>(outcome.returndata()) && field(outcome, 0) == id as u256,
+    )
+}
+
+#[test]
+fn proceeds_wait_for_the_end() uses (evm: mut Evm) {
+    let m = market()
+    assert!(wrong_phase(try_withdraw(m), expected: 2, current: 0))
+    to_reveal(m)
+    assert!(wrong_phase(try_withdraw(m), expected: 2, current: 1))
+}
+
+// --- Deployment --------------------------------------------------------------
+
+fn deploy(seller: Address, supply: u64, min_lots: u64, reserve: Wei, penalty_bps: u256)
+uses (evm: mut Evm)
+{
+    let token = evm.create<ingot::token::LotToken>(value: Wei::zero(), args: (1000,))
+    let _ = evm
+        .create<ingot::tests::harness::GavelHarness>(
+            value: Wei::zero(),
+            args: (
+                seller,
+                token,
+                1,
+                supply,
+                min_lots,
+                reserve,
+                penalty_bps,
+                std::evm::hours(1),
+                std::evm::hours(1),
+            ),
+        )
+}
+
+#[test]
+fn valid_parameters_deploy() uses (evm: mut Evm) {
+    deploy(
+        seller: Address::new(1),
+        supply: 10,
+        min_lots: 10,
+        reserve: wei(1),
+        penalty_bps: 10_000,
+    )
+}
+
+#[test(should_revert, selector = 0x08c379a0)]
+fn penalty_above_100_percent_is_rejected() uses (evm: mut Evm) {
+    deploy(
+        seller: Address::new(1),
+        supply: 10,
+        min_lots: 1,
+        reserve: wei(1),
+        penalty_bps: 10_001,
+    )
+}
+
+#[test(should_revert, selector = 0x08c379a0)]
+fn min_lots_above_supply_is_rejected() uses (evm: mut Evm) {
+    deploy(
+        seller: Address::new(1),
+        supply: 10,
+        min_lots: 11,
+        reserve: wei(1),
+        penalty_bps: 0,
+    )
+}
+
+#[test(should_revert, selector = 0x08c379a0)]
+fn zero_seller_is_rejected() uses (evm: mut Evm) {
+    deploy(
+        seller: Address::zero(),
+        supply: 10,
+        min_lots: 1,
+        reserve: wei(1),
+        penalty_bps: 0,
+    )
+}
+
+#[test]
+fn book_at_the_winner_cap_deploys() uses (evm: mut Evm) {
+    // ceil(512 / 2) = 256 possible winners: exactly the cap.
+    deploy(
+        seller: Address::new(1),
+        supply: 512,
+        min_lots: 2,
+        reserve: wei(1),
+        penalty_bps: 0,
+    )
+}
+
+#[test(should_revert, selector = 0x08c379a0)]
+fn book_above_the_winner_cap_is_rejected() uses (evm: mut Evm) {
+    // ceil(257 / 1) = 257 possible winners.
+    deploy(
+        seller: Address::new(1),
+        supply: 257,
+        min_lots: 1,
+        reserve: wei(1),
+        penalty_bps: 0,
+    )
+}
+
+#[test(should_revert, selector = 0x08c379a0)]
+fn zero_reserve_is_rejected() uses (evm: mut Evm) {
+    deploy(
+        seller: Address::new(1),
+        supply: 10,
+        min_lots: 1,
+        reserve: Wei::zero(),
+        penalty_bps: 0,
+    )
+}

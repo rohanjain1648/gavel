@@ -1,0 +1,215 @@
+//! Gas measurements and budgets.
+//!
+//! Each test emits what it measures as `GasUsed` events and asserts an
+//! upper bound, so a regression fails the suite. `scripts/gas-report.sh`
+//! prints the measurements as a table:
+//!
+//!     fe test --filter gas --show-logs
+//!
+//! The numbers include the test contract's call overhead (ABI encoding, the
+//! `CALL` itself), which is the same for every sample.
+use std::evm::{Address, Evm}
+use ingot::tests::harness::{
+    Market,
+    claim,
+    commit_exact,
+    new_bidder,
+    open_market,
+    reveal,
+    to_reveal,
+    to_settled,
+    withdraw_proceeds,
+}
+
+/// `what`: 1 reveal into a book of `size` bids, 2 reveal that evicts `size`
+/// bids, 3 claim with `size` bids in the auction, 4 commit,
+/// 5 seller withdrawal with `size` bids in the auction.
+#[event]
+struct GasUsed {
+    #[indexed]
+    what: u256,
+    size: u256,
+    gas: u256,
+}
+
+fn measured_reveal(_ m: Market, id: u64, price: u128, quantity: u64, salt: u256) -> u256
+uses (evm: mut Evm)
+{
+    let before = evm.gas()
+    let _ = reveal(m, id, price, quantity, salt)
+    before - evm.gas()
+}
+
+/// Commits `n` single-lot bids with rising prices from `bidder`.
+fn commit_ladder(_ m: Market, bidder: Address, n: u64) uses (evm: mut Evm) {
+    var i: u64 = 0
+    while i < n {
+        let _ = commit_exact(
+            m,
+            bidder,
+            price: (100 + i) as u128,
+            quantity: 1,
+            salt: i as u256,
+        )
+        i += 1
+    }
+}
+
+/// Reveal cost grows with the logarithm of the book, not with the number of
+/// bids: each reveal into a book of `n` bids is one sift through `log2(n)`
+/// levels of single-slot bids.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn gas_reveal_grows_logarithmically() uses (evm: mut Evm) {
+    let n: u64 = 128
+    let m = open_market(
+        supply: 128,
+        min_lots: 1,
+        reserve: std::evm::wei(1),
+        penalty_bps: 0,
+    )
+    let bidder = new_bidder()
+    // Falling prices: every new bid is the worst so far and sifts to the root,
+    // the deepest path through the heap.
+    var i: u64 = 0
+    while i < n {
+        let _ = commit_exact(
+            m,
+            bidder,
+            price: (1000 - i) as u128,
+            quantity: 1,
+            salt: i as u256,
+        )
+        i += 1
+    }
+    to_reveal(m)
+    var first: u256 = 0
+    var largest: u256 = 0
+    var id: u64 = 0
+    while id < n {
+        let gas = measured_reveal(
+            m,
+            id,
+            price: (1000 - id) as u128,
+            quantity: 1,
+            salt: id as u256,
+        )
+        let size = id as u256
+        if size == 1
+            || size == 2
+            || size == 4
+            || size == 8
+            || size == 16
+            || size == 32
+            || size == 64
+            || size == 127 {
+            evm.emit(GasUsed { what: 1, size, gas })
+        }
+        if size == 1 { first = gas }
+        if gas > largest {
+            largest = gas
+        }
+        id += 1
+    }
+    // A 127-bid book costs at most ~7 more sift levels than a 1-bid book.
+    assert!(largest < first + 7 * 12_000)
+}
+
+/// One large bid that pushes every bid out of a full book: the worst case
+/// for a single reveal. Each eviction is one heap pop.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn gas_eviction_cascade() uses (evm: mut Evm) {
+    var sizes: [u64; 4] = [8, 16, 32, 64]
+    for size in sizes {
+        let m = open_market(
+            supply: size,
+            min_lots: 1,
+            reserve: std::evm::wei(1),
+            penalty_bps: 0,
+        )
+        let small = new_bidder()
+        let whale = new_bidder()
+        commit_ladder(m, bidder: small, n: size)
+        let w = commit_exact(m, bidder: whale, price: 10_000, quantity: size, salt: 999)
+        to_reveal(m)
+        var i: u64 = 0
+        while i < size {
+            let _ = reveal(
+                m,
+                id: i,
+                price: (100 + i) as u128,
+                quantity: 1,
+                salt: i as u256,
+            )
+            i += 1
+        }
+        let gas = measured_reveal(m, id: w, price: 10_000, quantity: size, salt: 999)
+        evm.emit(GasUsed { what: 2, size: size as u256, gas })
+        // Bounded by the book size, which `min_lots` caps.
+        assert!(gas < 60_000 + size as u256 * 40_000)
+    }
+}
+
+/// Settling costs the same however many bids the auction had: there is no
+/// loop over bids anywhere in a claim or in the seller's withdrawal.
+#[test(balance = 1_000_000_000_000_000_000)]
+fn gas_settlement_is_constant() uses (evm: mut Evm) {
+    var sizes: [u64; 3] = [4, 32, 96]
+    var claim_costs: [u256; 3] = [0; 3]
+    var k: usize = 0
+    for size in sizes {
+        let m = open_market(
+            supply: size,
+            min_lots: 1,
+            reserve: std::evm::wei(1),
+            penalty_bps: 0,
+        )
+        let bidder = new_bidder()
+        commit_ladder(m, bidder, n: size)
+        to_reveal(m)
+        var i: u64 = 0
+        while i < size {
+            let _ = reveal(
+                m,
+                id: i,
+                price: (100 + i) as u128,
+                quantity: 1,
+                salt: i as u256,
+            )
+            i += 1
+        }
+        to_settled(m)
+        // The marginal bid (id 0) is the most involved claim.
+        let before = evm.gas()
+        let _ = claim(m, id: 0)
+        let claim_gas = before - evm.gas()
+        evm.emit(GasUsed { what: 3, size: size as u256, gas: claim_gas })
+        claim_costs[k] = claim_gas
+
+        let before_w = evm.gas()
+        let _ = withdraw_proceeds(m)
+        evm.emit(
+            GasUsed { what: 5, size: size as u256, gas: before_w - evm.gas() },
+        )
+        k += 1
+    }
+    // The same cost within 2%, from 4 bids to 96.
+    assert!(claim_costs[2] * 100 <= claim_costs[0] * 102)
+    assert!(claim_costs[0] * 100 <= claim_costs[2] * 102)
+}
+
+#[test(balance = 1_000_000_000_000_000_000)]
+fn gas_commit() uses (evm: mut Evm) {
+    let m = open_market(
+        supply: 10,
+        min_lots: 1,
+        reserve: std::evm::wei(1),
+        penalty_bps: 0,
+    )
+    let bidder = new_bidder()
+    let _ = commit_exact(m, bidder, price: 100, quantity: 1, salt: 0)
+    let before = evm.gas()
+    let _ = commit_exact(m, bidder, price: 100, quantity: 1, salt: 1)
+    let gas = before - evm.gas()
+    evm.emit(GasUsed { what: 4, size: 1, gas })
+    assert!(gas < 200_000)
+}
